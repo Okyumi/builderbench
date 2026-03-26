@@ -10,14 +10,14 @@
 <h2>
   <a href="https://arxiv.org/abs/2510.06288"><b>Paper</b></a> &ensp;·&ensp;
   <a href="https://rajghugare19.github.io/builderbench/"><b>Blogpost</b></a> &ensp;·&ensp;
-  <a href="https://builderbench-leaderboard.github.io"><b>Leaderboard</b></a>
+  <a href="https://rajghugare19.github.io/builderbench-leaderboard/"><b>Leaderboard</b></a>
 </h2>
 
 </div>
 
 BuilderBench is a benchmark to accelerate research into training that centers around exploration.  The vision for BuilderBench is to enable an open-ended stream of potential interactions, where pre-training could only ever cover a tiny slice of all possible behaviors. Our hypothesis is that the space of skills and discoveries that an agent has to know to build all possible structures is so vast, that it is impossible to memorize them at design time. This motivates the use of block-building to evaluate AI models in BuilderBench.
 
-Please check out our [paper](https://arxiv.org/abs/2510.06288) for details about BuilderBench and check out the [blogpost](https://rajghugare19.github.io/builderbench/) to see the failure modes of some of the strongest models (as of March 2026). We encourage you to try new ideas and submit your solutions to the [live leaderboard](https://builderbench-leaderboard.github.io)!
+Please check out our [paper](https://arxiv.org/abs/2510.06288) for details about BuilderBench and check out the [blogpost](https://rajghugare19.github.io/builderbench/) to see the failure modes of some of the strongest models (as of March 2026). We encourage you to try new ideas and submit your solutions to the [live leaderboard](https://rajghugare19.github.io/builderbench-leaderboard/)!
 
 Features include:
 1. A simulated environment consisting of a robot interacting with building blocks.
@@ -100,7 +100,7 @@ python submit.py \
 
 `submit.py` aggregates results across seeds, runs a consistency check (task version, git commit, model ID must match across seeds), and writes a leaderboard ready JSON file to `tmp/<level_id>-leaderboard.json`. See [scripts/submit_claude_opus4.6.sh](scripts/submit_claude_opus4.6.sh) for an example script of how to submit all tasks for an agent at once.
 
-Once the `tmp` folder is ready, follow the instructions in [leaderboard repository](https://github.com/RajGhugare19/builderbench-leaderboard.github.io) and make a new pull request. You need to place the `tmp` folder in the cloned repository and run `place_data.py` file in the [leaderboard repository](https://github.com/RajGhugare19/builderbench-leaderboard.github.io) and then make a new pull request.
+Once the `tmp` folder is ready, follow the instructions in [leaderboard repository](https://github.com/RajGhugare19/builderbench-leaderboard) and make a new pull request. You need to place the `tmp` folder in the cloned repository and run `place_data.py` file in the [leaderboard repository](https://github.com/RajGhugare19/builderbench-leaderboard) and then make a new pull request.
 
 # Paper Experiments
 
