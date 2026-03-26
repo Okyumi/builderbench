@@ -1,124 +1,156 @@
+<div align="center">
+  
+<h1>BuilderBench</h1>
 
-# BuilderBench
+<br>
 
-<p align="center">
-  <em>Can AI models build a world which today's generative models can only dream of?</em>
-</p>
+<img src="media/tasks.png" alt="BuilderBench tasks" />
+<p><sub><em><span style="color:grey">Can AI models build a world which today's generative models can only dream of?</span></em></sub></p>
 
-![image](assets/blocks.png)
+<h2>
+  <a href="https://arxiv.org/abs/2510.06288"><b>Paper</b></a> &ensp;·&ensp;
+  <a href="https://rajghugare19.github.io/builderbench/"><b>Blogpost</b></a> &ensp;·&ensp;
+  <a href="https://builderbench-leaderboard.github.io"><b>Leaderboard</b></a>
+</h2>
 
-BuilderBench is a benchmark designed to facilitate research on open-ended exploration, embodied reasoning and reinforcement learning (RL). Features include:
+</div>
 
-- A **parallelizable** and **hardware-accelerated** simulator built using [MuJoCo](https://github.com/google-deepmind/mujoco) and [Jax](https://github.com/jax-ml/jax). Training a PPO policy to pick and place a block takes less than 5 minutes on one GPU and twelve CPU threads.
-- A task-suite of **42 ($\times$ 4 variations) tasks**, where each task requires qualitatively different reasoning capabilities.
-- **Single file implementations** for two self-supervised RL and four RL algorithms in jax.
+BuilderBench is a benchmark to accelerate research into training that centers around exploration.  The vision for BuilderBench is to enable an open-ended stream of potential interactions, where pre-training could only ever cover a tiny slice of all possible behaviors. Our hypothesis is that the space of skills and discoveries that an agent has to know to build all possible structures is so vast, that it is impossible to memorize them at design time. This motivates the use of block-building to evaluate AI models in BuilderBench.
 
-For more details, check out the [project website](https://rajghugare19.github.io/builderbench/) and [research paper](https://arxiv.org/abs/2510.06288).
+Please check out our [paper](https://arxiv.org/abs/2510.06288) for details about BuilderBench and check out the [blogpost](https://rajghugare19.github.io/builderbench/) to see the failure modes of some of the strongest models (as of March 2026). We encourage you to try new ideas and submit your solutions to the [live leaderboard](https://builderbench-leaderboard.github.io)!
 
-## Installation
+Features include:
+1. A simulated environment consisting of a robot interacting with building blocks.
+2. A task suite of 51 tasks for evaluating AI models.
+3. A wrapper for evaluating language model based agents.
+4. Single interface for evaluating OpenAI, Claude and Gemini language models and open-source model.
+5. Implementations of [Chain of Thought](https://arxiv.org/abs/2201.11903) and [Reflexion](https://arxiv.org/abs/2303.11366) agents.
 
-We have tested the installation on Ubuntu 22.04 and Ubuntu 24.04 using python 3.10.
+# Installation
 
-### From source 
+Prerequisites: [uv package manager](https://docs.astral.sh/uv/getting-started/installation/).
 
-Clone the repository and enter the main folder. 
+1. Clone the repository:
+   ```bash
+   git clone <repo-url>
+   cd builderbench
+   ```
 
-The main dependencies for BuilderBench environments is mujoco, jax, and optax. For installing the BuilderBench environments:
+2. Install the package and its dependencies:
+   ```bash
+   uv venv --python 3.12
+   uv sync
+   ```
 
-```shell
-pip install -e .
-```
+3. Set up your API keys by creating a `SECRETS` file in the project root:
+   ```
+   OPENAI_API_KEY=your-openai-key
+   ANTHROPIC_API_KEY=your-anthropic-key
+   GEMINI_API_KEY=your-gemini-key
+   ```
+   The above step is not needed for self-hosted models via vLLM.
 
-For using reference implementations or developing new algorithms:
+# Usage
 
-```shell
-pip install -e ".[all]"
-```
-
-## Environments and Tasks
-
-The environment consists of a robot hand that can navigate in 3D space and interact with a set of cube shaped blocks. A task corresponds to a physically stable target structure built using cubes. Tasks are specified using the positions of the blocks in the target structure. A central insight of builderbench is that despite this seemingly simple setup, tasks can be arbitrarily complex and long-horizon and can require multiple steps of high-level reasoning. The builderbench task suite consists of over 40 such carefully curated tasks. Check out the [project website](https://rajghugare19.github.io/builderbench/) for visualizations and the list of tasks. All tasks are defined in the [create_task_data.py](builderbench/create_task_data.py) file. 
-
-## Simulator
-
-The step function of the environment is parallelized using multi-thread pooling implemented by MuJoCo's [rollout](https://mujoco.readthedocs.io/en/stable/python.html#rollout) functionality in C++. The rest of the environment code is written in jax in a jit friendly manner. The rollout function is used as a [jax callback](https://docs.jax.dev/en/latest/_autosummary/jax.experimental.io_callback.html#jax.experimental.io_callback) and the environments can be compiled **end to end on jax**, enjoying the benefits of `jit` and `vmap`. For instance, a PPO policy can be trained in less than 5 minutes to successfully pick and place a cube. 
-
-## Advantages of using MuJoCo Rollout
-- Rollout uses MuJoCo's native simulation code written in C/C++. This circumvents issues faced by [MuJoCo MJX](https://mujoco.readthedocs.io/en/stable/mjx.html#mjx-the-sharp-bits) when running scenes with many contacts. This is true in the case of building with large number of blocks.
-- [MuJoCo Warp](https://github.com/google-deepmind/mujoco_warp) allows scaling MuJoCo GPU simulation to much larger scenes. The main advantage of using MuJoCo Warp would be to run the environment completely on GPU and make the entire training loop simpler. **We have combined BuilderBench with MuJoCo Warp** in the warp branch. Currently, accurately simulating scenes and training using the warp backend is 5 times slower than rollout. This is for two main reasons. First, Warp is still in a beta release and some features have not been implemented (for example, the no slip solver). Second, we have not yet been able to tune the XML parameters to ensure training is both fast and accurate. **Reach out if you want to collaborate to make this happen.** The warp backend will become default once it is equally fast and if we are able to manually solve all tasks in the BuilderBench task-suite using it.
-
-## Running experiments
-
-![image](assets/train-eval-protocols.png)
-
-To evaluate open-ended exploration, embodied reasoning and generalization, we design the self-supervised protocol. As shown in the figure, in this protocol agents have to explore the environment in a self-supervised manner and learn policies that can solve unseen tasks at test time. We also provide a debug single-task supervised protocol meant to provide additional feedback for researchers. In this protocol, agents are trained and tested on the same task.
-
-### Self-supervised protocol
-
-Use the following command to run the MEGA algorithm in an environment with two cube. The policy will be evaluated in fixed intervals, on all tasks in the task-suite that correspond to two cubes.
-
+Before running experiments, one must generate task meta-data files. To create task data (`.npz` files in `builderbench/tasks/`):
 ```bash
-cd impls
-python play_ppo_mega.py --env_id=cube-2-play
+uv run python builderbench/create_task_data.py
 ```
+This saves meta-data configurations for all tasks to `builderbench/tasks/`.
 
-### Supervised protocol
 
-Use the following command to run the PPO algorithm on the first task in an environment with one cube. The policy will be evaluated in fixed intervals on the same task.
-
+To run a Reflexion agent powered by GPT 5.2 on the cube-9-task-3:
 ```bash
-cd impls
-python ppo.py --env_id=cube-1-task1
+uv run python run.py --client_name openai --model_id gpt-5.2-2025-12-11 --level_id cube-9-task-3 --agent_name cot --num_episode 3
 ```
 
-## Visualization
+To run a chain-of-thought agent powered by a self-hosted model (for e.g., Qwen3-4B-Instruct-2507) served via vLLM on the cube-1-task-1:
+```bash
+vllm serve Qwen/Qwen3-4B-Instruct-2507 --port 8080
 
-By default, training runs will store checkpoints at regular intervals in a `impls/checkpoint/` folder. To visualize how these checkpoints perform, we have provided code in [impls/video.py](https://github.com/RajGhugare19/build-stuff/blob/main/impls/video.py). This file will iterate over all the training runs present in the given folder (`impls/checkpoint/` by default) and record and save a video for all the checkpoints of every training run. The code uses PPO's checkpoints as an example, but other algorithms can be visualized similarly. 
+uv run python run.py --client_name vllm --base_url http://localhost:8080/v1 --model_id Qwen/Qwen3-4B-Instruct-2507 --level_id cube-1-task-1 --agent_name cot
+```
 
-## Code Structure
+**Agents Implemented**
 
-The core structure of the codebase is as follows:
+| Agent | File |
+|---|---|
+| Naive `naive` | [agents/naive.py](agents/naive.py) |
+| Chain-of-thought `cot` | [agents/cot.py](agents/cot.py) |
+| Reflexion `reflexion` | [agents/reflexion.py](agents/reflexion.py) |
 
-- `builderbench/`
-  - `assets/` assets for defining MuJoCo models
-  - `tasks/` meta-data for all tasks
-  - `xmls/` xml files for defining MuJoCo models
-  - `constants.py` predefined constants used for the environment
-  - `create_task_data.py` task definition and task data creation
-  - `build_block.py` supervised singletask protocol environment definition
-  - `build_block_play.py` self-supervised multitask protocol environment definition
-  - `env_utils.py` environment utilities.
-- `impls/`
-  - `utils/`
-    - `buffer.py` replay buffer for off policy algorithms
-    - `evaluation.py` supervised singletask protocol evaluation
-    - `evaluation_play.py` self-supervised multitask evaluation
-    - `networks.py` network definitions
-    - `running_statistics.py` normalization functions
-    - `wrapper.py` environment wrappers
-  - `crl.py` contrastive reinforcement learning : [https://arxiv.org/abs/2206.07568](https://arxiv.org/abs/2206.07568)
-  - `play_ppo_goalkde.py` maximum entropy goal achievement: [https://arxiv.org/pdf/2007.02832](https://arxiv.org/pdf/2007.02832)
-  - `play_ppo_sfl.py` sampling for learnability: [https://arxiv.org/abs/2408.15099](https://arxiv.org/abs/2408.15099)
-  - `ppo.py` proximal policy optimization: [https://arxiv.org/abs/1707.06347](https://arxiv.org/abs/1707.06347)
-  - `ppo_rnd.py`random network distillation: [https://arxiv.org/abs/1810.12894](https://arxiv.org/abs/1810.12894)
-  - `sac.py` soft actor critic: [https://arxiv.org/abs/1801.01290](https://arxiv.org/abs/1801.01290)
-  - `video.py` code to record videos of policy checkpoints
+# Leaderboard Submission
+
+After running `run.py`, results are stored under:
+```
+outputs/<agent_name>/<model_id>/<level_id>-seed-<seed>-timestamp-<...>/
+```
+
+Each run directory contains `eval_summary.jsonl`, `run_config.json`, and `run_metadata.json`.
+
+To generate a submission-ready file for a single task:
+```bash
+python submit.py \
+    --results_dir outputs/ \
+    --level_id cube-5-task-3 \
+    --model_id your-model-id \
+    --agent_name your-agent-name \
+    --website_url https://your-model-url
+```
+
+`submit.py` aggregates results across seeds, runs a consistency check (task version, git commit, model ID must match across seeds), and writes a leaderboard ready JSON file to `tmp/<level_id>-leaderboard.json`. See [scripts/submit_claude_opus4.6.sh](scripts/submit_claude_opus4.6.sh) for an example script of how to submit all tasks for an agent at once.
+
+Once the `tmp` folder is ready, follow the instructions in [leaderboard repository](https://github.com/RajGhugare19/builderbench-leaderboard.github.io) and make a new pull request. You need to place the `tmp` folder in the cloned repository and run `place_data.py` file in the [leaderboard repository](https://github.com/RajGhugare19/builderbench-leaderboard.github.io) and then make a new pull request.
+
+# Paper Experiments
+
+The scripts to replicate experiments from the paper are in the `scripts/` folder.
+
+**Agents evaluated:**
+- Claude Opus 4.6 — `reflexion` agent, 3 episodes
+- Gemini 3 Flash Preview — `reflexion` agent, 3 episodes
+- GPT-5.2 — `cot` agent, 1 episode
+
+**To run all tasks for a model:**
+```bash
+bash scripts/run_claude_opus4.6.sh
+bash scripts/run_gemini_flash3.1.sh
+bash scripts/run_openai_gpt5.2.sh
+```
+
+Tasks are processed in parallel (default is 1 job(s) in parallel) and logs are written inside the `scripts/` folder.
+
+**To create submission-ready results:**
+```bash
+bash scripts/submit_claude_opus4.6.sh
+bash scripts/submit_gemini_flash3.1.sh
+bash scripts/submit_openai_gpt5.2.sh
+```
+
+Submission scripts read the results of completed runs from `outputs/` and calls `submit.py` for each task.
+
+## RL experiments
+
+The code for tabula-rasa RL experiments can be found in the [`rl/`](rl/) folder.
+
+# Teleoperation
+
+The [teleop](teleop/) folder provides two scripts for manually controlling the robot in any environment — useful for exploring tasks or debugging. You can control the robot using the keyboard or a slider based GUI window. See the [teleop readme](teleop/README.md) for details.
 
 ## Acknowledgements
 
-1) [MuJoCo Playground](https://github.com/google-deepmind/mujoco_playground) for environment structuring.
-2) [MuJoCo](https://github.com/google-deepmind/mujoco) for the multithreading rollout functionality.
-3) [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie) for the robot hand model.
-4) [Brax](https://github.com/google/brax) for reference proximal policy optimization (ppo) implementation.
-5) [JaxGCRL](https://github.com/MichalBortkiewicz/JaxGCRL) for reference contrastive RL implementation.
+1) [OGBench](https://github.com/seohongpark/ogbench) for providing the backbone code to control the robot.
+2) [Balrog](https://github.com/balrog-ai/BALROG) for providing backbone code for the language model clients.
+3) [MuJoCo](https://github.com/google-deepmind/mujoco) for the physics simulation.
+4) [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie) for the robot model.
 
 ## Citation
 
 ```bibtex
 @misc{ghugare2025builderbench,
-      title={BuilderBench -- A benchmark for generalist agents}, 
-      author={Raj Ghugare and Catherine Ji and Kathryn Wantlin and Jin Schofield and Benjamin Eysenbach},
-      year={2025},
+      title={BuilderBench: The Building Blocks of Intelligent Agents}, 
+      author={Raj Ghugare and Roger Creus Castanyer and Catherine Ji and Kathryn Wantlin and Jin Schofield and Karthik Narasimhan and Benjamin Eysenbach},
+      year={2026},
       eprint={2510.06288},
       archivePrefix={arXiv},
       primaryClass={cs.AI},

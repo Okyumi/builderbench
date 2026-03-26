@@ -3,5 +3,7 @@ __pycache__/
 .vscode/
 *.egg-info/
 MUJOCO_LOG.txt
-*/checkpoints/
-*/videos/
+outputs/
+tmp/
+.venv
+*.npz

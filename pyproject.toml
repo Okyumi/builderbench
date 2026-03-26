@@ -1,56 +1,27 @@
 [build-system]
-requires = [ "setuptools", "wheel" ]
+requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "builderbench"
-version = "0.1.0"
-readme = "README.md"
-license = { file = "LICENSE" }
+version = "1.0.0"
+description = "BuilderBench: The Building Blocks of Intelligent Agents"
 requires-python = ">=3.10"
-authors = [
-  {name = "Raj Ghugare"},
-  {name = "Catherine Ji"},
-  {name = "Kathryn Wantlin"},
-  {name = "Jin Schofield"},
-  {name = "Benjamin Eysenbach"},
-]
-maintainers = [
-    {name = "Raj Ghugare"}
-]
-
-classifiers = [
-    "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
-]
-
 dependencies = [
-    "mujoco >= 3.3.6",
-    "mujoco-mjx >= 3.3.6",
-    "jax[cuda12] >= 0.6.2",
-    "optax >= 0.2.5",
-    "etils",
-    "ml_collections",
-]
-
-[project.optional-dependencies]
-train = [
-    "flax >= 0.10.5",
-    "distrax >= 0.1.5",
-    "wandb >= 0.19.1",
-    "wandb_osh >= 1.2.2",
+    "mujoco >= 3.1.6",
+    "dm_control >= 1.0.20",
+    "gymnasium[mujoco]",
+    "openai",
+    "anthropic",
+    "google-genai",
+    "simple-parsing",
     "mediapy",
-    "matplotlib",
-    "tyro",
+    "tabulate",
+    "tqdm",
+    "scipy",
+    "pynput",
 ]
-
-all = [
-    "builderbench[train]",
-]
-
-[project.urls]
-homepage = "https://rajghugare19.github.io/builderbench"
 
 [tool.setuptools.packages.find]
-where = ["."]
-include = ["builderbench*"]
+include = ["builderbench*", "agents*"]
+exclude = ["rl*"]
