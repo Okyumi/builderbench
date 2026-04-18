@@ -25,15 +25,23 @@
 - [x] Update `continual_crl.py` to use PaddedEnvWrapper for all tasks
 - [x] Update `continual_crl.py` to use UNIFIED_OBS_DIM/UNIFIED_GOAL_DIM for network creation
 
+- [x] Phase 3: CKA actor decomposition in Flax:
+  - Created `rl/impls/knowledge_pool.py` — pool with cosine-similarity merging
+  - CKA composition: θ' = θ_base + pool_c + v_k inside JIT-compiled training step
+  - Actor and critic CKA modes fully functional
+  - Gradients flow through composition to v_k (base and pool_c are additive constants)
+  - Uniform pool blending (TODO: learnable alpha)
+- [x] Phase 4: CKA critic decomposition (implemented alongside actor)
+
 ### In Progress
 
-- [ ] Phase 3: CKA actor decomposition in Flax (knowledge pool, base+vector composition)
+- [ ] End-to-end testing on a short run
 
 ### Next Steps
 
-- [ ] Phase 4: CKA critic decomposition
 - [ ] Phase 5: Comprehensive evaluation and continual RL metrics (forgetting, forward transfer)
-- [ ] Run baseline experiments (reset+reset, reset+persistent, persistent+persistent)
+- [ ] Run baseline experiments (all 9 actor×critic configurations)
+- [ ] Learnable alpha blending weights
 
 ---
 

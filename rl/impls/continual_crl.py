@@ -5,14 +5,19 @@ driver.  For each task in the sequence the inner loop collects data and trains;
 between tasks, actor and critic state are transferred according to actor_mode
 and critic_mode.
 
+Supports three transfer modes for each of actor and critic:
+  - reset:      reinitialise from scratch every task.
+  - persistent: carry forward the trained params.
+  - cka:        CKA-RL decomposition: θ' = θ_base + Σ α_j v_j + v_k.
+
 Usage (default – reset both networks each task):
   python continual_crl.py --task_sequence cube-2-task1,cube-2-task2,cube-2-task3
 
-Persistent critic, reset actor:
-  python continual_crl.py --actor_mode reset --critic_mode persistent
+CKA actor, persistent critic:
+  python continual_crl.py --actor_mode cka --critic_mode persistent
 
 Quick test (2 tasks, 1M steps each):
-  python continual_crl.py --task_sequence cube-2-task1,cube-2-task2 \
+  python continual_crl.py --task_sequence cube-2-task1,cube-2-task2 \\
       --steps_per_task 1000000
 """
 import os
@@ -53,6 +58,7 @@ from utils.pad_wrapper import PaddedEnvWrapper, UNIFIED_OBS_DIM, UNIFIED_GOAL_DI
 from utils.evaluation import Evaluator
 from utils.networks import MLP, save_params, load_params
 from buildstuff.env_utils import make_env
+from knowledge_pool import KnowledgePool, pytree_zeros_like
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +114,8 @@ class Args:
     critic_mode: str = 'reset'      # 'reset', 'persistent', 'cka'
     steps_per_task: int = 50_000_000
     checkpoint_dir: str = './continual_checkpoints'
+    k_max: int = 10                 # knowledge pool capacity
+    alpha_scale: float = 1.0        # softmax temperature for pool blending
 
 
 # ---------------------------------------------------------------------------
@@ -329,7 +337,10 @@ def _parse_num_cubes(task_id: str) -> int:
 
 def evaluate_on_task(task_id, args, actor_params, critic_params,
                      actor, g_encoder, key):
-    """Run evaluation on a single task and return metrics dict."""
+    """Run evaluation on a single task and return metrics dict.
+
+    ``actor_params`` must be the *composed* (full) policy params, not v_k.
+    """
     orig_env_id = args.env_id
     args.env_id = task_id
     num_cubes = _parse_num_cubes(task_id)
@@ -365,7 +376,16 @@ def evaluate_on_task(task_id, args, actor_params, critic_params,
 
 
 # ---------------------------------------------------------------------------
-# Single-task training loop (extracted from crl.py)
+# CKA composition helpers
+# ---------------------------------------------------------------------------
+
+def _compose_params(base, pool_c, vk):
+    """θ' = θ_base + pool_contribution + v_k."""
+    return jax.tree_map(lambda b, p, v: b + p + v, base, pool_c, vk)
+
+
+# ---------------------------------------------------------------------------
+# Single-task training loop
 # ---------------------------------------------------------------------------
 
 def train_single_task(
@@ -378,13 +398,26 @@ def train_single_task(
     sa_encoder: SA_encoder,
     g_encoder: G_encoder,
     key: jax.Array,
+    # CKA-specific (None when not using CKA for that component)
+    actor_base_params=None,
+    actor_pool_c=None,
+    critic_base_params=None,
+    critic_pool_c=None,
 ):
     """Run the inner CRL training loop for one task.
 
+    When ``actor_base_params`` is not None, the actor is in CKA mode:
+    ``actor_state.params`` represents v_k and the effective policy is
+    θ_base + pool_c + v_k.
+
+    Same logic applies to critic with ``critic_base_params``.
+
     Returns:
-        (actor_state, critic_state, metrics_history)
+        (actor_state, critic_state)
     """
     args.env_id = task_id
+    use_actor_cka = actor_base_params is not None
+    use_critic_cka = critic_base_params is not None
 
     # Derive training step counts from steps_per_task
     num_training_step = args.steps_per_task // (args.num_envs * args.rollout_length)
@@ -396,6 +429,10 @@ def train_single_task(
           flush=True)
     print(f'  Env steps per training step = '
           f'{args.num_envs * args.rollout_length}', flush=True)
+    if use_actor_cka:
+        print(f'  Actor CKA: training v_k (base frozen)', flush=True)
+    if use_critic_cka:
+        print(f'  Critic CKA: training w_k (base frozen)', flush=True)
 
     # ---- environment -------------------------------------------------------
     key, env_key, eval_key, buffer_key = jax.random.split(key, 4)
@@ -482,11 +519,33 @@ def train_single_task(
         key=eval_key,
     )
 
+    # ---- helpers to get composed params from training state ----------------
+    # These closures capture base/pool_c so the JIT-compiled functions can use
+    # them.  When not in CKA mode the "compose" is identity.
+
+    def _get_actor_params(ts):
+        """Return the effective (composed) actor params."""
+        if use_actor_cka:
+            return _compose_params(actor_base_params, actor_pool_c,
+                                   ts.actor_state.params)
+        return ts.actor_state.params
+
+    def _get_critic_params(ts):
+        """Return the effective (composed) critic params."""
+        if use_critic_cka:
+            return _compose_params(critic_base_params, critic_pool_c,
+                                   ts.critic_state.params)
+        return ts.critic_state.params
+
     # ---- JIT-compiled training functions -----------------------------------
+
     def actor_step(training_state, env, env_state, key, extra_fields, metrics_fields):
-        g_encoder_params = training_state.critic_state.params["g_encoder"]
-        g_repr = g_encoder.apply(g_encoder_params, env_state.info['target_goal'])
-        means, log_stds = actor.apply(training_state.actor_state.params, env_state.obs, g_repr)
+        effective_critic = _get_critic_params(training_state)
+        effective_actor = _get_actor_params(training_state)
+
+        g_repr = g_encoder.apply(effective_critic["g_encoder"],
+                                 env_state.info['target_goal'])
+        means, log_stds = actor.apply(effective_actor, env_state.obs, g_repr)
         stds = jnp.exp(log_stds)
         actions = nn.tanh(means + stds * jax.random.normal(key, shape=means.shape, dtype=means.dtype))
 
@@ -541,80 +600,149 @@ def train_single_task(
             f, (training_state, env_state, buffer_state, key), (),
             length=int(np.ceil(args.min_replay_size / args.rollout_length)))[0]
 
-    @jax.jit
-    def update_actor_and_alpha(transitions, training_state, key):
-        def actor_loss(actor_params, critic_params, transitions, key):
-            state = transitions.observation
-            goal = transitions.extras['future_goal']
-            sa_encoder_params = jax.lax.stop_gradient(critic_params["sa_encoder"])
-            g_encoder_params = jax.lax.stop_gradient(critic_params["g_encoder"])
+    # -- actor update --------------------------------------------------------
+    # When CKA: actor_state.params = v_k.  Gradients of the actor loss w.r.t.
+    # the composed policy equal gradients w.r.t. v_k (base and pool_c are
+    # constant additive terms) so we can differentiate w.r.t. v_k directly.
+    if use_actor_cka:
+        @jax.jit
+        def update_actor_and_alpha(transitions, training_state, key):
+            def actor_loss(vk_params, critic_params, transitions, key):
+                composed = _compose_params(actor_base_params, actor_pool_c,
+                                           vk_params)
+                state = transitions.observation
+                goal = transitions.extras['future_goal']
+                sa_encoder_params = jax.lax.stop_gradient(critic_params["sa_encoder"])
+                g_encoder_params = jax.lax.stop_gradient(critic_params["g_encoder"])
 
-            g_repr = g_encoder.apply(g_encoder_params, goal)
-            means, log_stds = actor.apply(actor_params, state, g_repr)
-            stds = jnp.exp(log_stds)
-            x_ts = means + stds * jax.random.normal(key, shape=means.shape, dtype=means.dtype)
-            action = nn.tanh(x_ts)
-            log_prob = jax.scipy.stats.norm.logpdf(x_ts, loc=means, scale=stds)
-            log_prob -= jnp.log((1 - jnp.square(action)) + 1e-6)
-            log_prob = log_prob.sum(-1)
+                g_repr = g_encoder.apply(g_encoder_params, goal)
+                means, log_stds = actor.apply(composed, state, g_repr)
+                stds = jnp.exp(log_stds)
+                x_ts = means + stds * jax.random.normal(key, shape=means.shape, dtype=means.dtype)
+                action = nn.tanh(x_ts)
+                log_prob = jax.scipy.stats.norm.logpdf(x_ts, loc=means, scale=stds)
+                log_prob -= jnp.log((1 - jnp.square(action)) + 1e-6)
+                log_prob = log_prob.sum(-1)
 
-            sa_repr = sa_encoder.apply(sa_encoder_params, state, action)
-            qf_pi = -jnp.sqrt(jnp.sum((sa_repr - g_repr) ** 2, axis=-1))
+                sa_repr = sa_encoder.apply(sa_encoder_params, state, action)
+                qf_pi = -jnp.sqrt(jnp.sum((sa_repr - g_repr) ** 2, axis=-1))
 
-            actor_loss = jnp.mean(args.entropy_cost * log_prob - qf_pi)
-            return actor_loss, log_prob
+                return jnp.mean(args.entropy_cost * log_prob - qf_pi), log_prob
 
-        (actorloss, log_prob), actor_grad = jax.value_and_grad(actor_loss, has_aux=True)(
-            training_state.actor_state.params, training_state.critic_state.params,
-            transitions, key)
-        new_actor_state = training_state.actor_state.apply_gradients(grads=actor_grad)
-        training_state = training_state.replace(actor_state=new_actor_state)
+            effective_critic = _get_critic_params(training_state)
+            (actorloss, log_prob), actor_grad = jax.value_and_grad(actor_loss, has_aux=True)(
+                training_state.actor_state.params, effective_critic,
+                transitions, key)
+            new_actor_state = training_state.actor_state.apply_gradients(grads=actor_grad)
+            training_state = training_state.replace(actor_state=new_actor_state)
+            return training_state, {"sample_entropy": -log_prob, "actor_loss": actorloss}
+    else:
+        @jax.jit
+        def update_actor_and_alpha(transitions, training_state, key):
+            def actor_loss(actor_params, critic_params, transitions, key):
+                state = transitions.observation
+                goal = transitions.extras['future_goal']
+                sa_encoder_params = jax.lax.stop_gradient(critic_params["sa_encoder"])
+                g_encoder_params = jax.lax.stop_gradient(critic_params["g_encoder"])
 
-        metrics = {
-            "sample_entropy": -log_prob,
-            "actor_loss": actorloss,
-        }
-        return training_state, metrics
+                g_repr = g_encoder.apply(g_encoder_params, goal)
+                means, log_stds = actor.apply(actor_params, state, g_repr)
+                stds = jnp.exp(log_stds)
+                x_ts = means + stds * jax.random.normal(key, shape=means.shape, dtype=means.dtype)
+                action = nn.tanh(x_ts)
+                log_prob = jax.scipy.stats.norm.logpdf(x_ts, loc=means, scale=stds)
+                log_prob -= jnp.log((1 - jnp.square(action)) + 1e-6)
+                log_prob = log_prob.sum(-1)
 
-    @jax.jit
-    def update_critic(transitions, training_state, key):
-        def critic_loss(critic_params, transitions, key):
-            sa_encoder_params = critic_params["sa_encoder"]
-            g_encoder_params = critic_params["g_encoder"]
+                sa_repr = sa_encoder.apply(sa_encoder_params, state, action)
+                qf_pi = -jnp.sqrt(jnp.sum((sa_repr - g_repr) ** 2, axis=-1))
 
-            state = transitions.observation
-            action = transitions.action
-            goal = transitions.extras['future_goal']
+                return jnp.mean(args.entropy_cost * log_prob - qf_pi), log_prob
 
-            sa_repr = sa_encoder.apply(sa_encoder_params, state, action)
-            g_repr = g_encoder.apply(g_encoder_params, goal)
+            (actorloss, log_prob), actor_grad = jax.value_and_grad(actor_loss, has_aux=True)(
+                training_state.actor_state.params, training_state.critic_state.params,
+                transitions, key)
+            new_actor_state = training_state.actor_state.apply_gradients(grads=actor_grad)
+            training_state = training_state.replace(actor_state=new_actor_state)
+            return training_state, {"sample_entropy": -log_prob, "actor_loss": actorloss}
 
-            logits = -jnp.sqrt(jnp.sum((sa_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1))
-            critic_loss = -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits, axis=1))
+    # -- critic update -------------------------------------------------------
+    if use_critic_cka:
+        @jax.jit
+        def update_critic(transitions, training_state, key):
+            def critic_loss(wk_params, transitions, key):
+                composed = _compose_params(critic_base_params, critic_pool_c,
+                                           wk_params)
+                sa_encoder_params = composed["sa_encoder"]
+                g_encoder_params = composed["g_encoder"]
 
-            logsumexp = jax.nn.logsumexp(logits + 1e-6, axis=1)
-            critic_loss += args.logsumexp_cost * jnp.mean(logsumexp ** 2)
+                state = transitions.observation
+                action = transitions.action
+                goal = transitions.extras['future_goal']
 
-            I = jnp.eye(logits.shape[0])
-            correct = jnp.argmax(logits, axis=1) == jnp.argmax(I, axis=1)
-            logits_pos = jnp.sum(logits * I) / jnp.sum(I)
-            logits_neg = jnp.sum(logits * (1 - I)) / jnp.sum(1 - I)
+                sa_repr = sa_encoder.apply(sa_encoder_params, state, action)
+                g_repr = g_encoder.apply(g_encoder_params, goal)
 
-            return critic_loss, (logsumexp, correct, logits_pos, logits_neg)
+                logits = -jnp.sqrt(jnp.sum((sa_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1))
+                c_loss = -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits, axis=1))
 
-        (loss, (logsumexp, correct, logits_pos, logits_neg)), grad = jax.value_and_grad(
-            critic_loss, has_aux=True)(training_state.critic_state.params, transitions, key)
-        new_critic_state = training_state.critic_state.apply_gradients(grads=grad)
-        training_state = training_state.replace(critic_state=new_critic_state)
+                logsumexp = jax.nn.logsumexp(logits + 1e-6, axis=1)
+                c_loss += args.logsumexp_cost * jnp.mean(logsumexp ** 2)
 
-        metrics = {
-            "categorical_accuracy": jnp.mean(correct),
-            "logits_pos": logits_pos,
-            "logits_neg": logits_neg,
-            "logsumexp": logsumexp.mean(),
-            "critic_loss": loss,
-        }
-        return training_state, metrics
+                I = jnp.eye(logits.shape[0])
+                correct = jnp.argmax(logits, axis=1) == jnp.argmax(I, axis=1)
+                logits_pos = jnp.sum(logits * I) / jnp.sum(I)
+                logits_neg = jnp.sum(logits * (1 - I)) / jnp.sum(1 - I)
+                return c_loss, (logsumexp, correct, logits_pos, logits_neg)
+
+            (loss, (logsumexp, correct, logits_pos, logits_neg)), grad = jax.value_and_grad(
+                critic_loss, has_aux=True)(training_state.critic_state.params, transitions, key)
+            new_critic_state = training_state.critic_state.apply_gradients(grads=grad)
+            training_state = training_state.replace(critic_state=new_critic_state)
+            return training_state, {
+                "categorical_accuracy": jnp.mean(correct),
+                "logits_pos": logits_pos,
+                "logits_neg": logits_neg,
+                "logsumexp": logsumexp.mean(),
+                "critic_loss": loss,
+            }
+    else:
+        @jax.jit
+        def update_critic(transitions, training_state, key):
+            def critic_loss(critic_params, transitions, key):
+                sa_encoder_params = critic_params["sa_encoder"]
+                g_encoder_params = critic_params["g_encoder"]
+
+                state = transitions.observation
+                action = transitions.action
+                goal = transitions.extras['future_goal']
+
+                sa_repr = sa_encoder.apply(sa_encoder_params, state, action)
+                g_repr = g_encoder.apply(g_encoder_params, goal)
+
+                logits = -jnp.sqrt(jnp.sum((sa_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1))
+                c_loss = -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits, axis=1))
+
+                logsumexp = jax.nn.logsumexp(logits + 1e-6, axis=1)
+                c_loss += args.logsumexp_cost * jnp.mean(logsumexp ** 2)
+
+                I = jnp.eye(logits.shape[0])
+                correct = jnp.argmax(logits, axis=1) == jnp.argmax(I, axis=1)
+                logits_pos = jnp.sum(logits * I) / jnp.sum(I)
+                logits_neg = jnp.sum(logits * (1 - I)) / jnp.sum(1 - I)
+                return c_loss, (logsumexp, correct, logits_pos, logits_neg)
+
+            (loss, (logsumexp, correct, logits_pos, logits_neg)), grad = jax.value_and_grad(
+                critic_loss, has_aux=True)(training_state.critic_state.params, transitions, key)
+            new_critic_state = training_state.critic_state.apply_gradients(grads=grad)
+            training_state = training_state.replace(critic_state=new_critic_state)
+            return training_state, {
+                "categorical_accuracy": jnp.mean(correct),
+                "logits_pos": logits_pos,
+                "logits_neg": logits_neg,
+                "logsumexp": logsumexp.mean(),
+                "critic_loss": loss,
+            }
 
     @jax.jit
     def sgd_step(carry, transitions):
@@ -709,6 +837,10 @@ def train_single_task(
                 * args.num_envs * args.rollout_length
             ) / training_step_time
 
+            # Compose actor params for eval logging
+            eval_actor_p = _get_actor_params(training_state)
+            eval_critic_p = _get_critic_params(training_state)
+
             metrics = {
                 'training/sps': sps,
                 'training/walltime': training_walltime,
@@ -723,8 +855,8 @@ def train_single_task(
             rollout.shutdown_persistent_pool()
             metrics = evaluator.run_evaluation(
                 policy_params={
-                    "actor": training_state.actor_state.params,
-                    "g_encoder": training_state.critic_state.params["g_encoder"],
+                    "actor": eval_actor_p,
+                    "g_encoder": eval_critic_p["g_encoder"],
                 },
                 training_metrics=metrics,
             )
@@ -740,10 +872,7 @@ def train_single_task(
             if args.save_checkpoint:
                 save_params(
                     f"{task_save_path}/params_{es}.pkl",
-                    params=(
-                        training_state.actor_state.params,
-                        training_state.critic_state.params,
-                    )
+                    params=(eval_actor_p, eval_critic_p),
                 )
 
             xt, data_collect_step_time, learn_step_time = time.time(), 0, 0
@@ -766,6 +895,8 @@ def main(args: Args):
     print(f'Sequence: {tasks}')
     print(f'Actor mode: {args.actor_mode} | Critic mode: {args.critic_mode}')
     print(f'Steps per task: {args.steps_per_task}')
+    if args.actor_mode == 'cka' or args.critic_mode == 'cka':
+        print(f'k_max: {args.k_max} | alpha_scale: {args.alpha_scale}')
     print(f'{"=" * 60}\n')
 
     # Validate modes
@@ -773,14 +904,6 @@ def main(args: Args):
         f'Unknown actor_mode: {args.actor_mode}'
     assert args.critic_mode in ('reset', 'persistent', 'cka'), \
         f'Unknown critic_mode: {args.critic_mode}'
-    if args.actor_mode == 'cka':
-        # TODO: Phase 3 - CKA decomposition for actor
-        print('  WARNING: actor_mode=cka not yet implemented, falling back to persistent.')
-        args.actor_mode = 'persistent'
-    if args.critic_mode == 'cka':
-        # TODO: Phase 3 - CKA decomposition for critic
-        print('  WARNING: critic_mode=cka not yet implemented, falling back to persistent.')
-        args.critic_mode = 'persistent'
 
     args.exp_name = (
         f"{args.wandb_name_tag + '__' if args.wandb_name_tag else ''}"
@@ -802,8 +925,6 @@ def main(args: Args):
         return
 
     # ---- initialise network modules ----------------------------------------
-    # Use unified (padded) dimensions so networks are compatible across all
-    # cube counts.  We still need a probe env to get action_size.
     args.env_id = tasks[0]
     env_class, default_config = make_env(args)
     probe_env = wrap_env(
@@ -824,16 +945,31 @@ def main(args: Args):
     fresh_sa_params = sa_encoder.init(sa_key, np.ones([1, obs_size]), np.ones([1, action_size]))
     fresh_g_params = g_encoder.init(g_key, np.ones([1, goal_size]))
 
-    # ---- restore state from checkpoint if resuming -------------------------
-    prev_actor_params = None
-    prev_critic_params = None
+    # ---- continual state ---------------------------------------------------
+    prev_actor_params = None       # full (composed) actor params from prev task
+    prev_critic_params = None      # full (composed) critic params from prev task
+    actor_base_params = None       # frozen base (CKA actor)
+    critic_base_params = None      # frozen base (CKA critic)
+    actor_pool = KnowledgePool(k_max=args.k_max)
+    critic_pool = KnowledgePool(k_max=args.k_max)
 
+    # ---- restore state from checkpoint if resuming -------------------------
     if start_task > 0:
         ckpt = load_ckpt(
             args.checkpoint_dir, start_task - 1,
             args.actor_mode, args.critic_mode, args.seed)
         prev_actor_params = ckpt['actor_params']
         prev_critic_params = ckpt['critic_params']
+        if args.actor_mode == 'cka':
+            actor_base_params = ckpt.get('actor_base_params')
+            pool_state = ckpt.get('actor_pool')
+            if pool_state is not None:
+                actor_pool.load_state_dict(pool_state)
+        if args.critic_mode == 'cka':
+            critic_base_params = ckpt.get('critic_base_params')
+            pool_state = ckpt.get('critic_pool')
+            if pool_state is not None:
+                critic_pool.load_state_dict(pool_state)
 
     # ---- task loop ---------------------------------------------------------
     for task_idx in range(start_task, num_tasks):
@@ -842,26 +978,46 @@ def main(args: Args):
         print(f'\n{"=" * 60}')
         print(f'Task {task_idx}/{num_tasks - 1}: {task_id}')
         print(f'Actor mode: {args.actor_mode} | Critic mode: {args.critic_mode}')
+        if args.actor_mode == 'cka':
+            print(f'Actor pool: {len(actor_pool)}/{args.k_max}')
+        if args.critic_mode == 'cka':
+            print(f'Critic pool: {len(critic_pool)}/{args.k_max}')
         print(f'{"=" * 60}\n')
 
         key, task_key = jax.random.split(key)
 
         # ---- determine actor params for this task --------------------------
+        # For CKA: actor_state.params = v_k (zero-init), base/pool_c passed
+        #          to train_single_task.
+        # For others: actor_state.params = full policy params.
+        cka_actor_base = None   # passed to train_single_task
+        cka_actor_pool_c = None
+        cka_critic_base = None
+        cka_critic_pool_c = None
+
         if task_idx == 0:
             actor_params = fresh_actor_params
         elif args.actor_mode == 'reset':
-            # Reinitialise from scratch
             key, reinit_key = jax.random.split(key)
             actor_params = actor.init(reinit_key, np.ones([1, obs_size]), np.ones([1, args.rep_size]))
         elif args.actor_mode == 'persistent':
-            # Carry forward from previous task
             assert prev_actor_params is not None
             actor_params = prev_actor_params
         elif args.actor_mode == 'cka':
-            # TODO: Phase 3 - CKA decomposition
-            # For now, carry forward (same as persistent)
-            assert prev_actor_params is not None
-            actor_params = prev_actor_params
+            if task_idx == 0:
+                # Task 0: train from scratch (base will be set after)
+                actor_params = fresh_actor_params
+            else:
+                assert actor_base_params is not None
+                cka_actor_base = actor_base_params
+                # Compute pool contribution (uniform blending)
+                # TODO: learnable alpha — for now use uniform weights
+                cka_actor_pool_c = actor_pool.compute_contribution(
+                    alpha_logits=None, alpha_scale=args.alpha_scale)
+                if cka_actor_pool_c is None:
+                    cka_actor_pool_c = pytree_zeros_like(actor_base_params)
+                # v_k starts as zeros
+                actor_params = pytree_zeros_like(actor_base_params)
 
         actor_state = TrainState.create(
             apply_fn=actor.apply,
@@ -885,9 +1041,20 @@ def main(args: Args):
             assert prev_critic_params is not None
             critic_params = prev_critic_params
         elif args.critic_mode == 'cka':
-            # TODO: Phase 3 - CKA decomposition for critic
-            assert prev_critic_params is not None
-            critic_params = prev_critic_params
+            if task_idx == 0:
+                critic_params = {
+                    "sa_encoder": fresh_sa_params,
+                    "g_encoder": fresh_g_params,
+                }
+            else:
+                assert critic_base_params is not None
+                cka_critic_base = critic_base_params
+                cka_critic_pool_c = critic_pool.compute_contribution(
+                    alpha_logits=None, alpha_scale=args.alpha_scale)
+                if cka_critic_pool_c is None:
+                    cka_critic_pool_c = pytree_zeros_like(critic_base_params)
+                # w_k starts as zeros
+                critic_params = pytree_zeros_like(critic_base_params)
 
         critic_state = TrainState.create(
             apply_fn=None,
@@ -928,11 +1095,42 @@ def main(args: Args):
             sa_encoder=sa_encoder,
             g_encoder=g_encoder,
             key=task_key,
+            actor_base_params=cka_actor_base,
+            actor_pool_c=cka_actor_pool_c,
+            critic_base_params=cka_critic_base,
+            critic_pool_c=cka_critic_pool_c,
         )
 
-        # ---- carry forward ---------------------------------------------------
-        prev_actor_params = actor_state.params
-        prev_critic_params = critic_state.params
+        # ---- post-task: carry forward / update pools -----------------------
+        if args.actor_mode == 'cka':
+            if task_idx == 0:
+                # Freeze base after task 0
+                actor_base_params = actor_state.params
+                # Initialise pool with zero vector
+                actor_pool.append(pytree_zeros_like(actor_base_params))
+                prev_actor_params = actor_state.params  # composed = base
+            else:
+                # actor_state.params IS v_k (the trained delta)
+                v_k = actor_state.params
+                actor_pool.append(v_k)
+                # Compose full params for eval/checkpoint
+                prev_actor_params = _compose_params(
+                    actor_base_params, cka_actor_pool_c, v_k)
+        else:
+            prev_actor_params = actor_state.params
+
+        if args.critic_mode == 'cka':
+            if task_idx == 0:
+                critic_base_params = critic_state.params
+                critic_pool.append(pytree_zeros_like(critic_base_params))
+                prev_critic_params = critic_state.params
+            else:
+                w_k = critic_state.params
+                critic_pool.append(w_k)
+                prev_critic_params = _compose_params(
+                    critic_base_params, cka_critic_pool_c, w_k)
+        else:
+            prev_critic_params = critic_state.params
 
         # ---- save continual checkpoint ---------------------------------------
         ckpt_data = {
@@ -941,6 +1139,12 @@ def main(args: Args):
             'task_idx': task_idx,
             'task_id': task_id,
         }
+        if args.actor_mode == 'cka':
+            ckpt_data['actor_base_params'] = actor_base_params
+            ckpt_data['actor_pool'] = actor_pool.state_dict()
+        if args.critic_mode == 'cka':
+            ckpt_data['critic_base_params'] = critic_base_params
+            ckpt_data['critic_pool'] = critic_pool.state_dict()
         save_ckpt(args.checkpoint_dir, task_idx,
                   args.actor_mode, args.critic_mode, args.seed, ckpt_data)
 
