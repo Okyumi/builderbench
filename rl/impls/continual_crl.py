@@ -23,6 +23,7 @@ os.environ["XLA_FLAGS"] = xla_flags
 os.environ["MUJOCO_GL"] = "egl"
 
 import pickle
+import re
 import time
 import tyro
 import numpy as np
@@ -48,6 +49,7 @@ from wandb_osh.hooks import TriggerWandbSyncHook
 
 from utils.buffer import TrajectoryUniformSamplingQueue
 from utils.wrapper import wrap_env
+from utils.pad_wrapper import PaddedEnvWrapper, UNIFIED_OBS_DIM, UNIFIED_GOAL_DIM
 from utils.evaluation import Evaluator
 from utils.networks import MLP, save_params, load_params
 from buildstuff.env_utils import make_env
@@ -101,7 +103,7 @@ class Args:
     min_replay_size: int = 1000
 
     # continual learning
-    task_sequence: str = 'cube-2-task1,cube-2-task2,cube-2-task3,cube-2-task4,cube-2-task5'
+    task_sequence: str = 'cube-1-task1,cube-1-task2,cube-2-task1,cube-2-task2,cube-2-task3,cube-3-task1,cube-3-task3,cube-2-task4,cube-2-task5,cube-3-task2,cube-3-task4,cube-3-task5'
     actor_mode: str = 'reset'       # 'reset', 'persistent', 'cka'
     critic_mode: str = 'reset'      # 'reset', 'persistent', 'cka'
     steps_per_task: int = 50_000_000
@@ -318,18 +320,26 @@ def auto_resume(base_dir, num_tasks, actor_mode, critic_mode, seed):
 # Cross-task evaluation
 # ---------------------------------------------------------------------------
 
+def _parse_num_cubes(task_id: str) -> int:
+    """Extract cube count from task ID like 'cube-2-task1'."""
+    m = re.search(r"cube-(\d+)", task_id)
+    assert m is not None, f'Cannot parse cube count from task_id={task_id!r}'
+    return int(m.group(1))
+
+
 def evaluate_on_task(task_id, args, actor_params, critic_params,
                      actor, g_encoder, key):
     """Run evaluation on a single task and return metrics dict."""
     orig_env_id = args.env_id
     args.env_id = task_id
+    num_cubes = _parse_num_cubes(task_id)
 
     env_class, config = make_env(args)
-    eval_env = wrap_env(
-        env_class(num_envs=args.num_eval_envs,
-                  num_threads=args.num_threads,
-                  config=config),
-        config.episode_length)
+    raw_eval_env = env_class(num_envs=args.num_eval_envs,
+                             num_threads=args.num_threads,
+                             config=config)
+    eval_env = PaddedEnvWrapper(wrap_env(raw_eval_env, config.episode_length),
+                                actual_cubes=num_cubes)
 
     make_policy = make_inference_fn(actor, g_encoder)
     evaluator = Evaluator(
@@ -389,26 +399,27 @@ def train_single_task(
 
     # ---- environment -------------------------------------------------------
     key, env_key, eval_key, buffer_key = jax.random.split(key, 4)
+    num_cubes = _parse_num_cubes(task_id)
 
     env_class, default_config = make_env(args)
-    env = wrap_env(
-        env_class(num_envs=args.num_envs,
-                  num_threads=args.num_threads,
-                  config=default_config),
-        default_config.episode_length)
-    eval_env = wrap_env(
-        env_class(num_envs=args.num_eval_envs,
-                  num_threads=args.num_threads,
-                  config=default_config),
-        default_config.episode_length)
+    raw_env = env_class(num_envs=args.num_envs,
+                        num_threads=args.num_threads,
+                        config=default_config)
+    env = PaddedEnvWrapper(wrap_env(raw_env, default_config.episode_length),
+                           actual_cubes=num_cubes)
+    raw_eval_env = env_class(num_envs=args.num_eval_envs,
+                             num_threads=args.num_threads,
+                             config=default_config)
+    eval_env = PaddedEnvWrapper(wrap_env(raw_eval_env, default_config.episode_length),
+                                actual_cubes=num_cubes)
     episode_length = default_config.episode_length
 
     reset_fn = jax.jit(env.reset)
     env_keys = jax.random.split(env_key, args.num_envs)
     env_state = reset_fn(env_keys)
-    obs_size = env.observation_size
+    obs_size = UNIFIED_OBS_DIM
     action_size = env.action_size
-    goal_size = env.goal_size
+    goal_size = UNIFIED_GOAL_DIM
 
     log_data_metric_keys = []
     for k in ("obj_reached_once", "obj_lifted", "obj_moved"):
@@ -790,9 +801,9 @@ def main(args: Args):
         print(f'  All {num_tasks} tasks already completed. Nothing to do.')
         return
 
-    # ---- initialise network modules (needed for shape queries) -------------
-    # We initialise against the first task to get obs/action/goal sizes.
-    # All tasks in Phase 1 share the same dimensions (2 cubes).
+    # ---- initialise network modules ----------------------------------------
+    # Use unified (padded) dimensions so networks are compatible across all
+    # cube counts.  We still need a probe env to get action_size.
     args.env_id = tasks[0]
     env_class, default_config = make_env(args)
     probe_env = wrap_env(
@@ -800,9 +811,9 @@ def main(args: Args):
         default_config.episode_length)
 
     key, actor_key, sa_key, g_key = jax.random.split(key, 4)
-    obs_size = probe_env.observation_size
+    obs_size = UNIFIED_OBS_DIM
     action_size = probe_env.action_size
-    goal_size = probe_env.goal_size
+    goal_size = UNIFIED_GOAL_DIM
 
     actor = Actor(action_size=action_size)
     sa_encoder = SA_encoder(rep_size=args.rep_size)
