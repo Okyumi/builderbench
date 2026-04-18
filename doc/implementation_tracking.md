@@ -1,6 +1,6 @@
 # Implementation Tracking
 
-## Status: Phase 3 In Progress — CKA Decomposition
+## Status: Phase 5 Complete — Full Continual CRL with Metrics
 
 ### Completed
 
@@ -33,19 +33,83 @@
   - Uniform pool blending (TODO: learnable alpha)
 - [x] Phase 4: CKA critic decomposition (implemented alongside actor)
 
+- [x] Phase 5: Parity with SGCRL reference implementation:
+  - **adapt_heads_only** (default `True`): head/body splitting for CKA actor
+  - **encoder_from_base** (default `False`): gradient masking for body params
+  - **Post-task head/body splitting**: body v_k folded into θ_base, only head deltas pooled
+  - **rl_metrics module**: full Flax port (weight_norm, final_layer_norm, feature_rank, NRC1/2, dormant_ratio, entropy, Gini)
+  - **base_steps**: separate env step budget for task 0
+  - **Checkpoint robustness**: JAX→numpy conversion for pickling
+  - **RL metrics integration**: frequent/occasional logging to W&B
+
 ### In Progress
 
-- [ ] End-to-end testing on a short run
+- [ ] End-to-end testing on GPU cluster
 
 ### Next Steps
 
-- [ ] Phase 5: Comprehensive evaluation and continual RL metrics (forgetting, forward transfer)
 - [ ] Run baseline experiments (all 9 actor×critic configurations)
 - [ ] Learnable alpha blending weights
+- [ ] Video recording during cross-task evaluation
 
 ---
 
 ## Decision Log
+
+### 2026-04-19: SGCRL Parity — adapt_heads_only and encoder_from_base
+
+**Decision:** Port the `adapt_heads_only` and `encoder_from_base` flags from SGCRL to BuilderBench, matching the exact CKA-RL algorithm.
+
+**Rationale:** These are core CKA-RL features that were missing from the initial BuilderBench implementation:
+
+1. **adapt_heads_only** (default `True`): After each task, the v_k delta is split:
+   - Body params (Dense_0..3, LayerNorm_0..3): folded into θ_base — the encoder evolves across tasks
+   - Head params (Dense_4 mean, Dense_5 log_std): stored in the knowledge pool as vectors
+   - This matches the CKA-RL paper's design: the representation encoder adapts freely while only the policy head is decomposed.
+
+2. **encoder_from_base** (default `False`): When `True`, body gradients are zeroed during training, freezing the encoder at the base-task values. CKA-RL's default is `False` — the body receives gradients and evolves. This flag exists for ablation studies.
+
+**Implementation detail (Flax vs Haiku):**
+
+In SGCRL (Haiku), head detection uses `'Normal' in path_str` because Haiku's NormalTanhDistribution creates modules named `Normal/linear` and `Normal/linear_1`.
+
+In BuilderBench (Flax), the Actor uses `@nn.compact` with auto-naming. The body is Dense_0..3 + LayerNorm_0..3, and the head is Dense_4 (mean) + Dense_5 (log_std). Detection uses `ACTOR_HEAD_LAYER_NAMES = ('Dense_4', 'Dense_5')`.
+
+### 2026-04-19: RL Representation Metrics
+
+**Decision:** Port the full `rl_metrics` module from SGCRL, adapted for Flax.
+
+**Metrics implemented:**
+| Metric | Level | Description |
+|---|---|---|
+| weight_norm_l2 | frequent | L2 norm of all params (actor and critic) |
+| final_layer_norm | frequent | L2 norm of actor head (Dense_4) kernel |
+| feature_entropy | frequent | Shannon entropy of |feature| distributions |
+| gini_sparsity | frequent | Gini coefficient for feature sparsity |
+| feature_rank | occasional | Effective rank via SVD (τ=0.99) |
+| nrc1 | occasional | Neural Rank Collapse: subspace collapse |
+| nrc2 | occasional | Feature-weight alignment |
+| dormant_ratio | occasional | Fraction of dead neurons (threshold 1e-5) |
+
+**Flax adaptation:** Feature extraction calls `sa_encoder.apply(...)` and `g_encoder.apply(...)` directly. Final layer kernel detection uses Flax's `Dense_N/kernel` naming instead of Haiku's `sa_encoder/linear_N/w`.
+
+### 2026-04-19: Post-task Persistent Actor Fix
+
+**Decision:** Fix persistent actor mode to match SGCRL behaviour.
+
+**Previous behaviour:** `prev_actor_params = actor_state.params` — this is correct for reset and persistent modes but the composed policy was not properly extracted when CKA was NOT used. Now, the `composed_actor` is always computed before any pool updates, ensuring the snapshot is correct.
+
+### 2026-04-19: base_steps Flag
+
+**Decision:** Add `base_steps` flag (default 50M) allowing task 0 to have a different training budget.
+
+**Rationale:** In SGCRL, `base_steps` is separate from `steps_per_task` because the base task may need more/fewer steps. This is important for experiments where the base representation needs thorough training before continual learning begins.
+
+### 2026-04-19: Checkpoint Robustness
+
+**Decision:** Convert JAX arrays to numpy before pickling, matching SGCRL.
+
+**Rationale:** JAX arrays use device-specific memory layouts. Pickling JAX arrays directly can fail when loading on a different device or after JAX version changes. The SGCRL approach (`jax.tree_map(np.array, ...)` on save, `jax.tree_map(jnp.array, ...)` on load) is portable and robust.
 
 ### 2026-04-18: 12-Task Sequence (Revised)
 
@@ -98,6 +162,55 @@
 
 ## Change Log
 
+### 2026-04-19 (session 3) — SGCRL Parity Update
+
+**New file: `rl/impls/rl_metrics.py`**
+- Full RL representation metrics module for Flax
+- weight_norm_l2, final_layer_norm (Dense_4 detection), feature_entropy, gini_sparsity
+- feature_rank (SVD), compute_nrc1, compute_nrc2, dormant_ratio
+- extract_critic_features using Flax encoder `.apply()`
+- _get_encoder_final_kernel with Flax Dense_N naming
+- compute_all_metrics dispatcher (frequent / occasional levels)
+
+**Updated: `rl/impls/continual_crl.py`**
+
+Major additions:
+1. **adapt_heads_only flag** (default `True`):
+   - `ACTOR_HEAD_LAYER_NAMES = ('Dense_4', 'Dense_5')` — Flax head layer detection
+   - `_is_actor_head_leaf(path)` — checks if a param path belongs to the head
+   - `_split_head_body(base_params, vk_params)` — post-task v_k splitting
+   - Post-task logic: when `adapt_heads_only=True`, body v_k folded into base, head v_k stored in pool
+
+2. **encoder_from_base flag** (default `False`):
+   - `_mask_body_grads(grads)` — zeros out non-head gradients using `tree_map_with_path`
+   - `freeze_actor_body` computed once at start of `train_single_task()`
+   - Applied inside CKA actor update after `value_and_grad`
+
+3. **base_steps flag** (default 50M):
+   - `task_steps = args.base_steps if task_idx == 0 else args.steps_per_task`
+   - Allows task 0 to train for a different number of steps
+
+4. **rl_metrics integration**:
+   - Import `rl_metrics` module
+   - `log_rl_metrics` flag (default `True`)
+   - Frequent metrics every eval interval, occasional every 5× interval
+   - Samples a batch from replay buffer for feature-level metrics
+   - Logs under `rl_metrics/` prefix to W&B
+
+5. **Checkpoint robustness**:
+   - `save_ckpt()`: `jax.tree_map(np.array, ...)` before pickle
+   - `load_ckpt()`: `jax.tree_map(jnp.array, ...)` after unpickle
+   - Checkpoint path now includes `adapt_heads_only` in config key
+
+6. **Persistent actor fix**:
+   - `composed_actor` computed before pool/base updates
+   - Persistent mode correctly carries composed policy
+
+7. **Code documentation**:
+   - Actor module annotated with layer indices (Dense_0..5)
+   - Head detection documented with Flax naming convention
+   - Module docstring updated with adapt_heads_only and encoder_from_base usage
+
 ### 2026-04-18 (session 2)
 
 - Created `rl/impls/utils/pad_wrapper.py`:
@@ -115,3 +228,17 @@
 - Created `doc/implementation_plan.md`
 - Created `doc/implementation_tracking.md`
 - Created `rl/impls/continual_crl.py`
+
+---
+
+## File Inventory
+
+| File | Purpose | Status |
+|---|---|---|
+| `rl/impls/continual_crl.py` | Main continual training driver | Complete |
+| `rl/impls/knowledge_pool.py` | KnowledgePool with cosine-similarity merging | Complete |
+| `rl/impls/rl_metrics.py` | RL representation metrics (Flax) | Complete |
+| `rl/impls/utils/pad_wrapper.py` | Observation/goal padding wrapper | Complete |
+| `rl/impls/crl.py` | Original single-task CRL (unchanged) | Reference |
+| `doc/implementation_plan.md` | Design document | Complete |
+| `doc/implementation_tracking.md` | This file | Maintained |

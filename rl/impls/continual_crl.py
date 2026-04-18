@@ -10,6 +10,18 @@ Supports three transfer modes for each of actor and critic:
   - persistent: carry forward the trained params.
   - cka:        CKA-RL decomposition: θ' = θ_base + Σ α_j v_j + v_k.
 
+Flags that control CKA behaviour:
+  --adapt_heads_only  (default True)
+      When True, only the actor head (mean + log_std Dense layers) are
+      decomposed into pool vectors.  After each task the body part of v_k
+      is folded into θ_base so the encoder evolves, while the pool stores
+      only head deltas.  This matches CKA-RL.
+
+  --encoder_from_base  (default False)
+      When True AND adapt_heads_only is True, body gradients are zeroed
+      during training so the encoder stays exactly at the base-task values.
+      CKA-RL default is False: the encoder receives gradients and evolves.
+
 Usage (default – reset both networks each task):
   python continual_crl.py --task_sequence cube-2-task1,cube-2-task2,cube-2-task3
 
@@ -59,6 +71,29 @@ from utils.evaluation import Evaluator
 from utils.networks import MLP, save_params, load_params
 from buildstuff.env_utils import make_env
 from knowledge_pool import KnowledgePool, pytree_zeros_like
+import rl_metrics
+
+
+# ---------------------------------------------------------------------------
+# Flax Actor head/body detection
+# ---------------------------------------------------------------------------
+# The Flax Actor uses @nn.compact with auto-naming:
+#   Dense_0 .. Dense_3 (1024-width)  → body
+#   LayerNorm_0 .. LayerNorm_3       → body
+#   Dense_4 (mean projection)        → head
+#   Dense_5 (log_std projection)     → head
+#
+# A param leaf's *path* (from tree_flatten_with_path) looks like:
+#   ('params', 'Dense_4', 'kernel')  or  ('params', 'Dense_5', 'bias')
+# We detect head leaves by checking for 'Dense_4' or 'Dense_5' in the path.
+
+ACTOR_HEAD_LAYER_NAMES = ('Dense_4', 'Dense_5')
+
+
+def _is_actor_head_leaf(path) -> bool:
+    """Return True if a Flax param path belongs to the actor head."""
+    path_str = '/'.join(str(p) for p in path)
+    return any(name in path_str for name in ACTOR_HEAD_LAYER_NAMES)
 
 
 # ---------------------------------------------------------------------------
@@ -113,9 +148,20 @@ class Args:
     actor_mode: str = 'reset'       # 'reset', 'persistent', 'cka'
     critic_mode: str = 'reset'      # 'reset', 'persistent', 'cka'
     steps_per_task: int = 50_000_000
+    base_steps: int = 50_000_000    # env steps for base task (task 0)
     checkpoint_dir: str = './continual_checkpoints'
     k_max: int = 10                 # knowledge pool capacity
     alpha_scale: float = 1.0        # softmax temperature for pool blending
+
+    # CKA behaviour
+    adapt_heads_only: bool = True   # only store head deltas in pool (CKA-RL)
+    encoder_from_base: bool = False # freeze encoder body during CKA training
+
+    # evaluation
+    eval_episodes: int = 128        # envs used for cross-task evaluation
+
+    # representation metrics
+    log_rl_metrics: bool = True     # log weight norms, feature rank, NRC, etc.
 
 
 # ---------------------------------------------------------------------------
@@ -201,21 +247,21 @@ class Actor(nn.Module):
         bias_init = nn.initializers.zeros
 
         x = jnp.concatenate([s, g_repr], axis=-1)
-        x = nn.Dense(1024, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+        x = nn.Dense(1024, kernel_init=lecun_unfirom, bias_init=bias_init)(x)  # Dense_0
         x = normalize(x)
         x = nn.swish(x)
-        x = nn.Dense(1024, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+        x = nn.Dense(1024, kernel_init=lecun_unfirom, bias_init=bias_init)(x)  # Dense_1
         x = normalize(x)
         x = nn.swish(x)
-        x = nn.Dense(1024, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+        x = nn.Dense(1024, kernel_init=lecun_unfirom, bias_init=bias_init)(x)  # Dense_2
         x = normalize(x)
         x = nn.swish(x)
-        x = nn.Dense(1024, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+        x = nn.Dense(1024, kernel_init=lecun_unfirom, bias_init=bias_init)(x)  # Dense_3
         x = normalize(x)
         x = nn.swish(x)
 
-        mean = nn.Dense(self.action_size, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
-        log_std = nn.Dense(self.action_size, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+        mean = nn.Dense(self.action_size, kernel_init=lecun_unfirom, bias_init=bias_init)(x)     # Dense_4 (HEAD)
+        log_std = nn.Dense(self.action_size, kernel_init=lecun_unfirom, bias_init=bias_init)(x)   # Dense_5 (HEAD)
 
         log_std = nn.tanh(log_std)
         log_std = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX - self.LOG_STD_MIN) * (log_std + 1)
@@ -278,43 +324,50 @@ def make_inference_fn(policy_network, g_encoder_network):
 # Checkpoint utilities
 # ---------------------------------------------------------------------------
 
-def _ckpt_dir(base_dir, actor_mode, critic_mode, seed):
+def _ckpt_dir(base_dir, actor_mode, critic_mode, adapt_heads_only, seed):
     """Checkpoint directory keyed by ablation config."""
-    config_key = f'actor_{actor_mode}_critic_{critic_mode}'
+    config_key = f'actor_{actor_mode}_critic_{critic_mode}_heads_{adapt_heads_only}'
     return os.path.join(base_dir, config_key, f'seed_{seed}')
 
 
-def _ckpt_path(base_dir, task_idx, actor_mode, critic_mode, seed):
+def _ckpt_path(base_dir, task_idx, actor_mode, critic_mode, adapt_heads_only, seed):
     return os.path.join(
-        _ckpt_dir(base_dir, actor_mode, critic_mode, seed),
+        _ckpt_dir(base_dir, actor_mode, critic_mode, adapt_heads_only, seed),
         f'task_{task_idx}.pkl')
 
 
-def save_ckpt(base_dir, task_idx, actor_mode, critic_mode, seed, data):
-    path = _ckpt_path(base_dir, task_idx, actor_mode, critic_mode, seed)
+def save_ckpt(base_dir, task_idx, actor_mode, critic_mode, adapt_heads_only, seed, data):
+    path = _ckpt_path(base_dir, task_idx, actor_mode, critic_mode, adapt_heads_only, seed)
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    # Convert JAX arrays to numpy for robust pickling
+    data_np = jax.tree_map(
+        lambda x: np.array(x) if isinstance(x, jnp.ndarray) else x, data)
     with open(path, 'wb') as f:
-        pickle.dump(data, f)
+        pickle.dump(data_np, f)
     print(f'  [ckpt] Saved -> {path}', flush=True)
 
 
-def load_ckpt(base_dir, task_idx, actor_mode, critic_mode, seed):
-    path = _ckpt_path(base_dir, task_idx, actor_mode, critic_mode, seed)
+def load_ckpt(base_dir, task_idx, actor_mode, critic_mode, adapt_heads_only, seed):
+    path = _ckpt_path(base_dir, task_idx, actor_mode, critic_mode, adapt_heads_only, seed)
     if not os.path.exists(path):
         raise FileNotFoundError(
             f'No checkpoint at {path}. Check that a previous run used the '
             f'same config (actor_mode={actor_mode}, critic_mode={critic_mode}, '
-            f'seed={seed}).')
+            f'adapt_heads_only={adapt_heads_only}, seed={seed}).')
     with open(path, 'rb') as f:
         data = pickle.load(f)
+    # Convert back to JAX arrays
+    data_jax = jax.tree_map(
+        lambda x: jnp.array(x) if isinstance(x, np.ndarray) else x, data)
     print(f'  [ckpt] Loaded <- {path}', flush=True)
-    return data
+    return data_jax
 
 
-def auto_resume(base_dir, num_tasks, actor_mode, critic_mode, seed):
+def auto_resume(base_dir, num_tasks, actor_mode, critic_mode, adapt_heads_only, seed):
     """Find the highest completed task index, or -1 if none."""
     for probe_idx in range(num_tasks - 1, -1, -1):
-        path = _ckpt_path(base_dir, probe_idx, actor_mode, critic_mode, seed)
+        path = _ckpt_path(base_dir, probe_idx, actor_mode, critic_mode,
+                          adapt_heads_only, seed)
         if os.path.exists(path):
             print(f'  [auto-resume] Found checkpoint for task {probe_idx} '
                   f'-> resuming from task {probe_idx + 1}.', flush=True)
@@ -384,6 +437,51 @@ def _compose_params(base, pool_c, vk):
     return jax.tree_map(lambda b, p, v: b + p + v, base, pool_c, vk)
 
 
+def _split_head_body(base_params, vk_params):
+    """Split v_k into head (for pool) and body (fold into base).
+
+    For adapt_heads_only mode:
+      - Head params (Dense_4, Dense_5): base unchanged, v_k goes to pool
+      - Body params (everything else): fold v_k into base, zero out v_k
+
+    Returns (new_base, head_only_vk).
+    """
+    out_base_leaves, out_vk_leaves = [], []
+    flat_base, treedef = jax.tree_util.tree_flatten_with_path(base_params)
+    flat_vk, _ = jax.tree_util.tree_flatten_with_path(vk_params)
+
+    n_head, n_body = 0, 0
+    for (path, b), (_, v) in zip(flat_base, flat_vk):
+        if _is_actor_head_leaf(path):
+            # Head: base unchanged, v_k goes to pool
+            out_base_leaves.append(b)
+            out_vk_leaves.append(v)
+            n_head += 1
+        else:
+            # Body: fold v_k into base, zero out
+            out_base_leaves.append(b + v)
+            out_vk_leaves.append(jnp.zeros_like(v))
+            n_body += 1
+
+    new_base = treedef.unflatten(out_base_leaves)
+    head_only_vk = treedef.unflatten(out_vk_leaves)
+    print(f'  [pool] head params: {n_head}, body params (folded): {n_body}',
+          flush=True)
+    return new_base, head_only_vk
+
+
+def _mask_body_grads(grads):
+    """Zero out body gradients, keeping only head gradients.
+
+    Used when encoder_from_base=True to freeze the encoder body.
+    """
+    def _mask_leaf(path, g):
+        if _is_actor_head_leaf(path):
+            return g  # head: keep gradient
+        return jnp.zeros_like(g)  # body: zero gradient
+    return jax.tree_util.tree_map_with_path(_mask_leaf, grads)
+
+
 # ---------------------------------------------------------------------------
 # Single-task training loop
 # ---------------------------------------------------------------------------
@@ -418,12 +516,22 @@ def train_single_task(
     args.env_id = task_id
     use_actor_cka = actor_base_params is not None
     use_critic_cka = critic_base_params is not None
+    # Determine whether to mask body gradients
+    freeze_actor_body = (use_actor_cka and args.encoder_from_base
+                         and task_idx > 0)
 
-    # Derive training step counts from steps_per_task
-    num_training_step = args.steps_per_task // (args.num_envs * args.rollout_length)
+    # Use base_steps for task 0, steps_per_task for rest
+    task_steps = args.base_steps if task_idx == 0 else args.steps_per_task
+
+    # Derive training step counts
+    num_training_step = task_steps // (args.num_envs * args.rollout_length)
     num_training_steps_per_eval = max(num_training_step // args.num_eval_steps, 1)
 
+    # Metrics logging intervals (in training steps)
+    metrics_every = max(num_training_step // args.num_eval_steps, 1)
+
     print(f'  Training steps = {num_training_step}', flush=True)
+    print(f'  Env steps = {task_steps}', flush=True)
     print(f'  Gradient steps per training step = '
           f'{(args.sequence_length * args.num_envs) // args.batch_size}',
           flush=True)
@@ -431,6 +539,12 @@ def train_single_task(
           f'{args.num_envs * args.rollout_length}', flush=True)
     if use_actor_cka:
         print(f'  Actor CKA: training v_k (base frozen)', flush=True)
+        if freeze_actor_body:
+            print(f'  Actor: body gradients MASKED (encoder_from_base=True)',
+                  flush=True)
+        else:
+            print(f'  Actor: body receives gradients (encoder evolves)',
+                  flush=True)
     if use_critic_cka:
         print(f'  Critic CKA: training w_k (base frozen)', flush=True)
 
@@ -633,6 +747,12 @@ def train_single_task(
             (actorloss, log_prob), actor_grad = jax.value_and_grad(actor_loss, has_aux=True)(
                 training_state.actor_state.params, effective_critic,
                 transitions, key)
+
+            # When encoder_from_base=True, mask out body gradients so the
+            # encoder stays at base-task values.
+            if freeze_actor_body:
+                actor_grad = _mask_body_grads(actor_grad)
+
             new_actor_state = training_state.actor_state.apply_gradients(grads=actor_grad)
             training_state = training_state.replace(actor_state=new_actor_state)
             return training_state, {"sample_entropy": -log_prob, "actor_loss": actorloss}
@@ -788,12 +908,19 @@ def train_single_task(
     training_state, env_state, buffer_state, _ = prefill_replay_buffer(
         training_state, env_state, buffer_state, prefill_key)
 
+    # ---- RL metrics setup --------------------------------------------------
+    next_metrics_frequent = metrics_every if args.log_rl_metrics else float('inf')
+    next_metrics_occasional = 5 * metrics_every if args.log_rl_metrics else float('inf')
+
     # ---- training loop -----------------------------------------------------
     training_walltime = 0
     data_collect_step_time = 0
     learn_step_time = 0
     xt = time.time()
     metrics = None
+
+    # Cache for last batch (used by rl_metrics)
+    last_transitions = None
 
     # Per-task checkpoint save path
     if args.save_checkpoint:
@@ -820,6 +947,41 @@ def train_single_task(
         else:
             metrics = jax.tree_util.tree_map(
                 lambda x, y: x + y, metrics, (data_metrics | training_metrics))
+
+        # ---- RL representation metrics ------------------------------------
+        if args.log_rl_metrics and ts >= next_metrics_frequent:
+            if ts >= next_metrics_occasional:
+                rl_level = 'occasional'
+                next_metrics_occasional = ts + 5 * metrics_every
+                next_metrics_frequent = ts + metrics_every
+            else:
+                rl_level = 'frequent'
+                next_metrics_frequent = ts + metrics_every
+
+            try:
+                current_actor_p = _get_actor_params(training_state)
+                current_critic_p = _get_critic_params(training_state)
+
+                # Use a fresh sample from the buffer for features
+                key, metrics_key = jax.random.split(key)
+                _bs, sample_transitions = replay_buffer.sample(buffer_state)
+                # Take first batch_size samples, flatten
+                obs_sample = sample_transitions.observation[0, :args.batch_size]
+                act_sample = sample_transitions.action[0, :args.batch_size]
+                goal_sample = sample_transitions.achieved_goal[0, :args.batch_size]
+
+                m = rl_metrics.compute_all_metrics(
+                    sa_encoder, g_encoder,
+                    current_actor_p, current_critic_p,
+                    obs_sample, act_sample, goal_sample,
+                    action_dim=action_size,
+                    level=rl_level)
+                if args.track:
+                    wandb_m = {f'rl_metrics/{k}': v for k, v in m.items()}
+                    wandb_m['rl_metrics/env_steps'] = float(training_state.env_steps)
+                    wandb.log(wandb_m)
+            except Exception as e:
+                print(f'  [rl_metrics] Warning: {e}', flush=True)
 
         if ts % num_training_steps_per_eval == 0:
             es = ts // num_training_steps_per_eval
@@ -894,9 +1056,12 @@ def main(args: Args):
     print(f'Continual CRL — {num_tasks} tasks')
     print(f'Sequence: {tasks}')
     print(f'Actor mode: {args.actor_mode} | Critic mode: {args.critic_mode}')
-    print(f'Steps per task: {args.steps_per_task}')
+    print(f'Steps per task: {args.steps_per_task} | Base steps: {args.base_steps}')
+    print(f'adapt_heads_only: {args.adapt_heads_only} | '
+          f'encoder_from_base: {args.encoder_from_base}')
     if args.actor_mode == 'cka' or args.critic_mode == 'cka':
         print(f'k_max: {args.k_max} | alpha_scale: {args.alpha_scale}')
+    print(f'RL metrics: {args.log_rl_metrics}')
     print(f'{"=" * 60}\n')
 
     # Validate modes
@@ -917,7 +1082,7 @@ def main(args: Args):
     # ---- auto-resume -------------------------------------------------------
     last_completed = auto_resume(
         args.checkpoint_dir, num_tasks, args.actor_mode, args.critic_mode,
-        args.seed)
+        args.adapt_heads_only, args.seed)
     start_task = last_completed + 1
 
     if start_task >= num_tasks:
@@ -957,7 +1122,8 @@ def main(args: Args):
     if start_task > 0:
         ckpt = load_ckpt(
             args.checkpoint_dir, start_task - 1,
-            args.actor_mode, args.critic_mode, args.seed)
+            args.actor_mode, args.critic_mode,
+            args.adapt_heads_only, args.seed)
         prev_actor_params = ckpt['actor_params']
         prev_critic_params = ckpt['critic_params']
         if args.actor_mode == 'cka':
@@ -1011,7 +1177,6 @@ def main(args: Args):
                 assert actor_base_params is not None
                 cka_actor_base = actor_base_params
                 # Compute pool contribution (uniform blending)
-                # TODO: learnable alpha — for now use uniform weights
                 cka_actor_pool_c = actor_pool.compute_contribution(
                     alpha_logits=None, alpha_scale=args.alpha_scale)
                 if cka_actor_pool_c is None:
@@ -1102,22 +1267,46 @@ def main(args: Args):
         )
 
         # ---- post-task: carry forward / update pools -----------------------
+        # Snapshot composed policy BEFORE modifying pool/base
+        composed_actor = (_compose_params(cka_actor_base, cka_actor_pool_c,
+                                          actor_state.params)
+                          if cka_actor_base is not None
+                          else actor_state.params)
+
         if args.actor_mode == 'cka':
             if task_idx == 0:
-                # Freeze base after task 0
+                # Freeze base after task 0: base = trained policy
                 actor_base_params = actor_state.params
-                # Initialise pool with zero vector
+                # Initialise pool with zero vector (matches SGCRL)
                 actor_pool.append(pytree_zeros_like(actor_base_params))
                 prev_actor_params = actor_state.params  # composed = base
             else:
                 # actor_state.params IS v_k (the trained delta)
                 v_k = actor_state.params
-                actor_pool.append(v_k)
+
+                if args.adapt_heads_only:
+                    # Split v_k: fold body into base, store only head in pool
+                    actor_base_params, v_k_head_only = _split_head_body(
+                        actor_base_params, v_k)
+                    actor_pool.append(v_k_head_only)
+                else:
+                    # Full-policy adaptation: base unchanged, full v_k to pool
+                    actor_pool.append(v_k)
+
                 # Compose full params for eval/checkpoint
-                prev_actor_params = _compose_params(
-                    actor_base_params, cka_actor_pool_c, v_k)
+                prev_actor_params = composed_actor
+        elif args.actor_mode == 'persistent':
+            # Carry forward composed policy for next task
+            prev_actor_params = composed_actor
         else:
+            # Reset: just save for checkpoint
             prev_actor_params = actor_state.params
+
+        # Critic post-task
+        composed_critic = (_compose_params(cka_critic_base, cka_critic_pool_c,
+                                           critic_state.params)
+                           if cka_critic_base is not None
+                           else critic_state.params)
 
         if args.critic_mode == 'cka':
             if task_idx == 0:
@@ -1127,10 +1316,9 @@ def main(args: Args):
             else:
                 w_k = critic_state.params
                 critic_pool.append(w_k)
-                prev_critic_params = _compose_params(
-                    critic_base_params, cka_critic_pool_c, w_k)
+                prev_critic_params = composed_critic
         else:
-            prev_critic_params = critic_state.params
+            prev_critic_params = composed_critic
 
         # ---- save continual checkpoint ---------------------------------------
         ckpt_data = {
@@ -1146,7 +1334,8 @@ def main(args: Args):
             ckpt_data['critic_base_params'] = critic_base_params
             ckpt_data['critic_pool'] = critic_pool.state_dict()
         save_ckpt(args.checkpoint_dir, task_idx,
-                  args.actor_mode, args.critic_mode, args.seed, ckpt_data)
+                  args.actor_mode, args.critic_mode,
+                  args.adapt_heads_only, args.seed, ckpt_data)
 
         # ---- cross-task evaluation -------------------------------------------
         print(f'\n  Evaluating on all tasks seen so far...', flush=True)
