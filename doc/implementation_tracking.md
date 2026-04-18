@@ -11,16 +11,24 @@
 - [x] Write comprehensive implementation plan (`doc/implementation_plan.md`)
 - [x] Initial commit to repository
 
+- [x] Create `rl/impls/continual_crl.py` — continual training driver with:
+  - Task sequence support
+  - Actor/critic transfer logic (reset / persistent / cka placeholder)
+  - Checkpoint save/load with config-keyed paths
+  - Auto-resume from latest checkpoint
+  - Cross-task evaluation after each task
+  - W&B logging integration
+
 ### In Progress
 
 - [ ] Phase 1: Run single-task CRL baselines on selected tasks (cube-2-task1 through cube-2-task5)
+- [ ] Test `continual_crl.py` end-to-end on a quick 2-task run
 
 ### Next Steps
 
-- [ ] Phase 2: Create `rl/impls/continual_crl.py` — continual training driver
-- [ ] Phase 3: CKA actor decomposition in Flax
-- [ ] Phase 4: Critic evolution modes (persistent / reset / CKA)
-- [ ] Phase 5: Cross-task evaluation and continual RL metrics
+- [ ] Phase 3: CKA actor decomposition in Flax (knowledge pool, base+vector composition)
+- [ ] Phase 4: CKA critic decomposition
+- [ ] Phase 5: Comprehensive evaluation and continual RL metrics (forgetting, forward transfer)
 
 ---
 
