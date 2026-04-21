@@ -1,6 +1,14 @@
 # Implementation Tracking
 
-## Status: Phase 5 Complete — Full Continual CRL with Metrics
+## Status: Phase 6 — Batch Experiment Pipeline
+
+### Added in Phase 6 (Apr 21, 2026)
+
+- [x] `rl/impls/experiment_configs.py` — enumerates the 3 × 3 × 3 actor/critic/seed grid (27 configs); emits shell-sourceable `KEY=VALUE` lines for each config. Mirrors `sgcrl/experiment_configs.py`.
+- [x] `rl/impls/draft_4.sh` — SLURM job-array launcher. Runs `TASKS_PER_GPU` experiments in parallel on one GPU; adapts `XLA_PYTHON_CLIENT_MEM_FRACTION` to the parallelism; writes identical headers to both `.out` and `.err`. Mirrors `sgcrl/draft_4.sh`.
+- [x] Negative-bank flags are exposed as placeholders. The launcher probes `continual_crl.py` at startup (`grep -q neg_bank_mode`) and emits `--neg_bank_*` flags only if the driver accepts them. When the bank is wired into the driver later, the launcher needs no changes.
+- [x] `doc/batch_experiments.md` — implementation note for the batch pipeline.
+- [x] `doc/hpc_commands.md` — cheatsheet of commands to run the project on the HPC terminal (setup, submission, monitoring, debug, W&B sync, negative-bank re-run once wired in).
 
 ### Completed
 
