@@ -116,7 +116,7 @@ class Args:
     # logging and checkpointing
     track: bool = True
     wandb_project_name: str = "buildstuff"
-    wandb_entity: str = 'nyuad-mmvc'
+    wandb_entity: str = 'nyuad_mmvc'
     wandb_mode: str = 'online'
     wandb_dir: str = './'
     wandb_group: str = 'test'
@@ -346,7 +346,7 @@ def save_ckpt(base_dir, task_idx, actor_mode, critic_mode, adapt_heads_only, see
     path = _ckpt_path(base_dir, task_idx, actor_mode, critic_mode, adapt_heads_only, seed)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     # Convert JAX arrays to numpy for robust pickling
-    data_np = jax.tree_map(
+    data_np = jax.tree_util.tree_map(
         lambda x: np.array(x) if isinstance(x, jnp.ndarray) else x, data)
     with open(path, 'wb') as f:
         pickle.dump(data_np, f)
@@ -363,7 +363,7 @@ def load_ckpt(base_dir, task_idx, actor_mode, critic_mode, adapt_heads_only, see
     with open(path, 'rb') as f:
         data = pickle.load(f)
     # Convert back to JAX arrays
-    data_jax = jax.tree_map(
+    data_jax = jax.tree_util.tree_map(
         lambda x: jnp.array(x) if isinstance(x, np.ndarray) else x, data)
     print(f'  [ckpt] Loaded <- {path}', flush=True)
     return data_jax
@@ -440,7 +440,7 @@ def evaluate_on_task(task_id, args, actor_params, critic_params,
 
 def _compose_params(base, pool_c, vk):
     """θ' = θ_base + pool_contribution + v_k."""
-    return jax.tree_map(lambda b, p, v: b + p + v, base, pool_c, vk)
+    return jax.tree_util.tree_map(lambda b, p, v: b + p + v, base, pool_c, vk)
 
 
 def _split_head_body(base_params, vk_params):
@@ -1033,8 +1033,6 @@ def train_single_task(
             pprint.pprint(metrics)
             if args.track:
                 wandb.log(metrics)
-                if args.wandb_mode == 'offline':
-                    trigger_sync()
             metrics = None
 
             if args.save_checkpoint:

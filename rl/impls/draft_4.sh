@@ -118,6 +118,8 @@ module load conda-gcc/11.2.0
 if command -v nvcc >/dev/null 2>&1; then
   CUDA_ROOT="$(dirname "$(dirname "$(command -v nvcc)")")"
   export LD_LIBRARY_PATH="${CUDA_ROOT}/lib64:${LD_LIBRARY_PATH:-}"
+  [ -d "${CUDA_ROOT}/targets/x86_64-linux/lib" ] && \
+    export LD_LIBRARY_PATH="${CUDA_ROOT}/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}"
 fi
 
 # Use uv-managed environment instead of conda.
@@ -130,24 +132,21 @@ source "$UV_ENV_PATH/bin/activate"
 
 # JAX CUDA wheels ship CUDA shared libs in site-packages; expose them.
 PY_CUDA_LIBS="$(python - <<'PY'
-import importlib, os
-mods = [
-    "nvidia.cusparse",
-    "nvidia.cublas",
-    "nvidia.cudnn",
-    "nvidia.cusolver",
-    "nvidia.cuda_runtime",
-]
+import glob, os
 paths = []
-for m in mods:
-    try:
-        mod = importlib.import_module(m)
-        libdir = os.path.join(os.path.dirname(mod.__file__), "lib")
-        if os.path.isdir(libdir):
-            paths.append(libdir)
-    except Exception:
-        pass
-print(":".join(paths))
+for libdir in glob.glob(os.path.join(
+    os.environ.get("VIRTUAL_ENV", ""), "lib", "python*", "site-packages",
+    "nvidia", "*", "lib"
+)):
+    if os.path.isdir(libdir):
+        paths.append(libdir)
+seen = set()
+ordered = []
+for p in paths:
+    if p not in seen:
+        seen.add(p)
+        ordered.append(p)
+print(":".join(ordered))
 PY
 )"
 [ -n "$PY_CUDA_LIBS" ] && export LD_LIBRARY_PATH="${PY_CUDA_LIBS}:${LD_LIBRARY_PATH:-}"
@@ -175,6 +174,7 @@ case "$TASKS_PER_GPU" in
   *)  MEM_FRAC="$(python -c "print(min(0.85, 0.9/$TASKS_PER_GPU))")" ;;
 esac
 export XLA_PYTHON_CLIENT_MEM_FRACTION="$MEM_FRAC"
+export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
 
 # ---- Detect whether the driver supports negative-bank flags ---------------
 DRIVER="$REPO_DIR/rl/impls/continual_crl.py"

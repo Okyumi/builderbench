@@ -48,6 +48,7 @@ class PaddedEnvWrapper:
         self._env = env
         self._actual_cubes = actual_cubes
         self._pad_cubes = MAX_CUBES - actual_cubes
+        self._goal_dim = None
         assert actual_cubes <= MAX_CUBES, (
             f'Task has {actual_cubes} cubes but MAX_CUBES={MAX_CUBES}')
 
@@ -104,11 +105,28 @@ class PaddedEnvWrapper:
     def _pad_goal(self, goal):
         """Pad goal from actual target cubes to MAX_CUBES."""
         actual_goal_dim = goal.shape[-1]
+        if self._goal_dim is None:
+            self._goal_dim = int(actual_goal_dim)
         if actual_goal_dim >= UNIFIED_GOAL_DIM:
             return goal[..., :UNIFIED_GOAL_DIM]
         pad_shape = goal.shape[:-1] + (UNIFIED_GOAL_DIM - actual_goal_dim,)
         return jnp.concatenate([goal, jnp.zeros(pad_shape, dtype=goal.dtype)],
                                axis=-1)
+
+    def _unpad_goal(self, goal):
+        """Trim padded goal back to raw env-specific dimensionality."""
+        if self._goal_dim is None:
+            return goal
+        return goal[..., :self._goal_dim]
+
+    def _state_for_env(self, state):
+        """Convert padded state info back to raw shapes expected by env."""
+        info = dict(state.info)
+        if 'target_goal' in info:
+            info['target_goal'] = self._unpad_goal(info['target_goal'])
+        if 'achieved_goal' in info:
+            info['achieved_goal'] = self._unpad_goal(info['achieved_goal'])
+        return state.replace(info=info)
 
     def _pad_state(self, state):
         """Pad obs and goal fields in a State.
@@ -134,13 +152,15 @@ class PaddedEnvWrapper:
         return self._pad_state(state)
 
     def pre_step(self, state, action):
-        return self._env.pre_step(state, action)
+        state_raw = self._state_for_env(state)
+        return self._env.pre_step(state_raw, action)
 
     def step(self, state, action):
         return self._env.step(state, action)
 
     def post_step(self, state, physics_state, sensor_data):
-        state = self._env.post_step(state, physics_state, sensor_data)
+        state_raw = self._state_for_env(state)
+        state = self._env.post_step(state_raw, physics_state, sensor_data)
         return self._pad_state(state)
 
     # ---- forward everything else to the underlying env --------------------
