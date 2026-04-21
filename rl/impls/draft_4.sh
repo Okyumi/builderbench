@@ -111,8 +111,14 @@ REPO_DIR="${REPO_DIR:-/scratch/yd2247/builderbench}"
 
 # ---- Environment setup ----------------------------------------------------
 module purge
-module load cuda/11.8.0
+module load cuda/12.2.0
 module load conda-gcc/11.2.0
+
+# Ensure CUDA runtime libs are discoverable for JAX CUDA plugin.
+if command -v nvcc >/dev/null 2>&1; then
+  CUDA_ROOT="$(dirname "$(dirname "$(command -v nvcc)")")"
+  export LD_LIBRARY_PATH="${CUDA_ROOT}/lib64:${LD_LIBRARY_PATH:-}"
+fi
 
 # Use uv-managed environment instead of conda.
 UV_ENV_PATH="${UV_ENV_PATH:-/scratch/yd2247/.venvs/builderbench}"
@@ -121,6 +127,30 @@ if [ ! -f "$UV_ENV_PATH/bin/activate" ]; then
   exit 1
 fi
 source "$UV_ENV_PATH/bin/activate"
+
+# JAX CUDA wheels ship CUDA shared libs in site-packages; expose them.
+PY_CUDA_LIBS="$(python - <<'PY'
+import importlib, os
+mods = [
+    "nvidia.cusparse",
+    "nvidia.cublas",
+    "nvidia.cudnn",
+    "nvidia.cusolver",
+    "nvidia.cuda_runtime",
+]
+paths = []
+for m in mods:
+    try:
+        mod = importlib.import_module(m)
+        libdir = os.path.join(os.path.dirname(mod.__file__), "lib")
+        if os.path.isdir(libdir):
+            paths.append(libdir)
+    except Exception:
+        pass
+print(":".join(paths))
+PY
+)"
+[ -n "$PY_CUDA_LIBS" ] && export LD_LIBRARY_PATH="${PY_CUDA_LIBS}:${LD_LIBRARY_PATH:-}"
 
 # Keep job caches and temp files on scratch.
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/scratch/yd2247/.cache}"

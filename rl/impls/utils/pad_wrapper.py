@@ -15,8 +15,6 @@ Goal layout: achieved_goal = positions of target cubes = 3 * num_target dims.
 """
 import jax.numpy as jnp
 
-from builderbench.env_utils import State
-
 MAX_CUBES = 3
 
 FIXED_OBS_PREFIX = 10   # gripper_pos(3) + gripper_quat(4) + gripper_linvel(3)
@@ -96,16 +94,7 @@ class PaddedEnvWrapper:
             new_info['achieved_goal'] = self._pad_goal(new_info['achieved_goal'])
         if 'target_goal' in new_info:
             new_info['target_goal'] = self._pad_goal(new_info['target_goal'])
-        return State(
-            physics_state=state.physics_state,
-            sensordata=state.sensordata,
-            ctrl=state.ctrl,
-            obs=new_obs,
-            reward=state.reward,
-            done=state.done,
-            metrics=state.metrics,
-            info=new_info,
-        )
+        return state.replace(obs=new_obs, info=new_info)
 
     # ---- env interface (matches Wrapper protocol) -------------------------
 

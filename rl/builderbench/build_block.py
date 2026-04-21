@@ -359,7 +359,7 @@ class CreativeCube():
     def get_obs(self, physics_state, sensor_data, ctrl, info):
 
         gripper_pos = sensor_data[self._gripper_pos_sensor_adr: self._gripper_pos_sensor_adr+self._gripper_pos_sensor_dim]
-        gripper_quat = sensor_data[self._gripper_quat_sensor_adr: self._gripper_quat_sensor_adr+self._gripper_quat_sensor_adr]
+        gripper_quat = sensor_data[self._gripper_quat_sensor_adr: self._gripper_quat_sensor_adr+self._gripper_quat_sensor_dim]
         gripper_quat = mjx_math.quat_mul(gripper_quat, self._init_gripper_quat_inverse)
         gripper_linvel = sensor_data[self._gripper_linvvel_sensor_adr:self._gripper_linvvel_sensor_adr+self._gripper_linvvel_sensor_dim]
 
