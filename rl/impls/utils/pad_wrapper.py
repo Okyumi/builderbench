@@ -1,26 +1,35 @@
 """Pads BuilderBench observations and goals to a fixed dimensionality.
 
-When tasks have fewer cubes than MAX_CUBES, the extra cube slots in the
-observation and goal are filled with zeros.  This allows networks trained
-on one task to be transferred to another task with a different cube count
-without shape mismatches.
+When tasks have fewer cubes than ``MAX_CUBES``, the extra cube slots in
+the observation and goal are zero-filled. This lets a single network be
+trained across a continual sequence of cube-1 / cube-2 / cube-3 tasks
+without shape mismatches in Dense / Linear layers.
 
-Observation layout (N cubes):
+Observation layout produced by ``build_block.CreativeCube.get_obs``
+(see rl/builderbench/build_block.py):
+
     gripper_pos(3) + gripper_quat(4) + gripper_linvel(3)               = 10
-    obj_pos(3*N) + obj_quat(4*N) + obj_linvel(3*N) + obj_angvel(3*N)  = 13*N
-    finger_pos(8)                                                       = 8
-    Total: 18 + 13*N
+    obj_pos(3*N) + obj_quat(4*N) + obj_linvel(3*N) + obj_angvel(3*N)   = 13*N
+    finger_pos(2)                                                      = 2
+    -----------------------------------------------------------------------
+    Total: 12 + 13*N
 
-Goal layout: achieved_goal = positions of target cubes = 3 * num_target dims.
+``finger_pos`` is indexed from ``self._fingers_qposadr``, which contains
+only the two driver joints ``['left_driver_joint', 'right_driver_joint']``
+(build_block.py:152-155), so its dimensionality is 2, not 8.
+
+Goal layout: ``achieved_goal`` = positions of target cubes, so dim = 3*T
+where T <= N is the number of target cubes for this task. We pad to
+``3 * MAX_CUBES``.
 """
 import jax.numpy as jnp
 
 MAX_CUBES = 3
 
 FIXED_OBS_PREFIX = 10   # gripper_pos(3) + gripper_quat(4) + gripper_linvel(3)
-FIXED_OBS_SUFFIX = 8    # finger_pos(8)
+FIXED_OBS_SUFFIX = 2    # finger_pos: 2 driver joints (left + right)
 PER_CUBE_OBS = 13       # pos(3) + quat(4) + linvel(3) + angvel(3)
-UNIFIED_OBS_DIM = FIXED_OBS_PREFIX + PER_CUBE_OBS * MAX_CUBES + FIXED_OBS_SUFFIX  # 57
+UNIFIED_OBS_DIM = FIXED_OBS_PREFIX + PER_CUBE_OBS * MAX_CUBES + FIXED_OBS_SUFFIX  # 51
 UNIFIED_GOAL_DIM = 3 * MAX_CUBES  # 9
 
 
@@ -59,7 +68,29 @@ class PaddedEnvWrapper:
     # ---- padding helpers --------------------------------------------------
 
     def _pad_obs(self, obs):
-        """Pad observation from actual_cubes to MAX_CUBES."""
+        """Pad observation from ``actual_cubes`` slots to ``MAX_CUBES`` slots.
+
+        Layout expected on input: ``[prefix | per-cube x N | suffix]``.
+        Layout produced on output: ``[prefix | per-cube x MAX_CUBES | suffix]``
+        with zero padding in the unused cube slots.
+
+        Asserts that the incoming observation has the expected pre-padding
+        dimensionality, catching any silent drift between the env layout
+        and the constants above.
+        """
+        expected_in = (
+            FIXED_OBS_PREFIX + PER_CUBE_OBS * self._actual_cubes
+            + FIXED_OBS_SUFFIX
+        )
+        actual_in = obs.shape[-1]
+        assert actual_in == expected_in, (
+            f'PaddedEnvWrapper: observation dim mismatch. '
+            f'Expected {expected_in} for {self._actual_cubes} cubes '
+            f'(prefix={FIXED_OBS_PREFIX}, per-cube={PER_CUBE_OBS}, '
+            f'suffix={FIXED_OBS_SUFFIX}), got {actual_in}. '
+            f'Check build_block.get_obs layout against pad_wrapper '
+            f'constants.'
+        )
         if self._pad_cubes == 0:
             return obs
         actual_obj_dim = PER_CUBE_OBS * self._actual_cubes

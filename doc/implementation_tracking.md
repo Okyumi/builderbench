@@ -2,6 +2,14 @@
 
 ## Status: Phase 6 — Batch Experiment Pipeline
 
+### Bug fix (Apr 21, 2026) — observation padding dim
+
+- [x] Root-caused `flax.errors.ScopeParamShapeError (121, 1024) vs (115, 1024)` in `continual_crl.py::actor_step`: `pad_wrapper.FIXED_OBS_SUFFIX` was set to 8 but the real `finger_pos` dim is 2 (from `build_block.py:152-155`, indexing `['left_driver_joint', 'right_driver_joint']`). The actor was initialised at declared `UNIFIED_OBS_DIM = 57` but the runtime obs was 51. See `doc/bug_fix_obs_padding.md`.
+- [x] `rl/impls/utils/pad_wrapper.py`: `FIXED_OBS_SUFFIX = 2` (was 8) → `UNIFIED_OBS_DIM = 51`. Module docstring rewritten to cite the real obs layout. `_pad_obs` gains a runtime assertion so any future layout drift fails loudly with a clear message instead of a cryptic Flax error deep in the stack.
+- [x] No changes needed in `continual_crl.py`: both `obs_size = UNIFIED_OBS_DIM` sites (lines 577, 1106) pick up the corrected value automatically.
+- [x] `doc/bug_fix_obs_padding.md`: full diagnosis and post-fix smoke-test instructions.
+- [ ] Pending: re-run the 9-cell grid once cuSPARSE is installed on the conda env (the same `.err` contained a cuSPARSE load failure that forces JAX to CPU; documented in the bug fix doc but fix is environmental, not in-repo).
+
 ### Added in Phase 6 (Apr 21, 2026)
 
 - [x] `rl/impls/experiment_configs.py` — enumerates the 3 × 3 × 3 actor/critic/seed grid (27 configs); emits shell-sourceable `KEY=VALUE` lines for each config. Mirrors `sgcrl/experiment_configs.py`.
