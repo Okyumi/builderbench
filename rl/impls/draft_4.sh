@@ -4,7 +4,7 @@
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=32GB
+#SBATCH --mem=96GB
 #SBATCH --partition=nvidia
 #SBATCH --output=/scratch/yd2247/builderbench/logs/continual/%A_%a.out
 #SBATCH --error=/scratch/yd2247/builderbench/logs/continual/%A_%a.err
@@ -44,7 +44,7 @@ set -euo pipefail
 # BuilderBench uses num_envs=2048 by default, which is lighter on memory
 # than the sgcrl grid. On an 80GB GPU you can typically run 4-8 in parallel.
 # Adjust if you see OOM.
-TASKS_PER_GPU="${TASKS_PER_GPU:-6}"
+TASKS_PER_GPU="${TASKS_PER_GPU:-4}"
 
 # ---- shared defaults (every experiment in the batch sees these) -----------
 # These mirror the `Args` dataclass defaults in continual_crl.py. Override
@@ -112,48 +112,25 @@ REPO_DIR="${REPO_DIR:-/scratch/yd2247/builderbench}"
 # ---- Environment setup ----------------------------------------------------
 module purge
 module load cuda/11.8.0
+module load conda-gcc/11.2.0
 
-# Headless MuJoCo rendering
-export MUJOCO_GL=egl
+# Use uv-managed environment instead of conda.
+UV_ENV_PATH="${UV_ENV_PATH:-/scratch/yd2247/.venvs/builderbench}"
+if [ ! -f "$UV_ENV_PATH/bin/activate" ]; then
+  echo "ERROR: uv environment not found at $UV_ENV_PATH" >&2
+  exit 1
+fi
+source "$UV_ENV_PATH/bin/activate"
 
-# Protobuf 4.x compat
-export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
-
-# Ignore ~/.local packages (avoid protobuf / TF conflicts)
-export PYTHONNOUSERSITE=1
-
-# Reduce TF / JAX log noise
-export TF_CPP_MIN_LOG_LEVEL=2
-export TF_CPP_MIN_VLOG_LEVEL=3
-
-# Unbuffered Python -> logs appear immediately in SLURM .out
-export PYTHONUNBUFFERED=1
-
-# Scratch-based caches
-export XDG_CACHE_HOME=/scratch/yd2247/.cache
-export PIP_CACHE_DIR=/scratch/yd2247/.cache/pip
-export TMPDIR=/scratch/yd2247/tmp
+# Keep job caches and temp files on scratch.
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/scratch/yd2247/.cache}"
+export PIP_CACHE_DIR="${PIP_CACHE_DIR:-$XDG_CACHE_HOME/pip}"
+export TMPDIR="${TMPDIR:-/scratch/yd2247/tmp}"
 mkdir -p "$XDG_CACHE_HOME" "$PIP_CACHE_DIR" "$TMPDIR"
 
-# Conda
-export MKL_INTERFACE_LAYER=LP64,GNU
-module load conda-gcc/11.2.0
-eval "$(conda shell.bash hook)"
-# BuilderBench env name -- adjust if yours is different.
-conda activate builderbench
-
-export PATH="${CONDA_PREFIX}/bin:$PATH"
-
-# Library paths
-export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
-MUJOCO_DIR="${MUJOCO_DIR:-$HOME/.mujoco/mujoco210}"
-[ -d "${MUJOCO_DIR}/bin" ] && export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:${MUJOCO_DIR}/bin"
-[ -n "${CUDA_HOME:-}" ] && [ -d "${CUDA_HOME}/lib64" ] && export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:${CUDA_HOME}/lib64"
-for _d in /usr/lib/nvidia /usr/lib64/nvidia; do
-  [ -d "$_d" ] && export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:$_d" && break
-done
-CUDNN_LIB=$(python -c "import nvidia.cudnn, os; print(os.path.join(os.path.dirname(nvidia.cudnn.__file__), 'lib'))" 2>/dev/null) || true
-[ -n "$CUDNN_LIB" ] && [ -d "$CUDNN_LIB" ] && export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:${CUDNN_LIB}"
+# Essential runtime environment.
+export MUJOCO_GL="${MUJOCO_GL:-egl}"
+export PYTHONUNBUFFERED=1
 
 # ---- JAX GPU memory allocation for multi-process sharing ------------------
 # With TASKS_PER_GPU=6 on an 80GB GPU we give each process ~15% (~12GB).

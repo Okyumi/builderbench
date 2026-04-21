@@ -42,7 +42,7 @@ import sys
 
 ACTOR_MODES = ['reset', 'persistent', 'cka']
 CRITIC_MODES = ['reset', 'persistent', 'cka']
-SEEDS = [1, 2, 3]
+SEEDS = [1, 2]
 
 # Per-run overrides that are applied to every configuration in the grid.
 # Keys match the lowercase flag names (without leading `--`) exposed by

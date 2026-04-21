@@ -5,8 +5,6 @@ import mujoco
 from flax import struct
 from typing import Any, Dict, Optional
 
-from builderbench.env_utils import State
-
 # Adapted from https://github.com/google/brax/blob/main/brax/envs/wrappers/training.py
 
 class Wrapper():
@@ -15,7 +13,7 @@ class Wrapper():
     def __init__(self, env: Any):
         self.env = env
 
-    def reset(self, rng) -> State:
+    def reset(self, rng):
         return self.env.reset(rng)
     
     def post_step(self, state, physics_state, sensor_data):
@@ -24,7 +22,7 @@ class Wrapper():
     def pre_step(self, state, action):
         return self.env.pre_step(state, action)
         
-    def step(self, state: State, action: jax.Array) -> State:
+    def step(self, state, action: jax.Array):
         return self.env.step(state, action)
 
     @property
@@ -58,7 +56,7 @@ class Wrapper():
     
     
 class AutoResetWrapper(Wrapper):
-    def reset(self, rng: jax.Array) -> State:
+    def reset(self, rng: jax.Array):
         state = self.env.reset(rng)
         state.info['first_physics_state'] = state.physics_state
         state.info['first_sensordata'] = state.sensordata
@@ -69,7 +67,7 @@ class AutoResetWrapper(Wrapper):
 
         return state
     
-    def pre_step(self, state: State, action: jax.Array) -> State:
+    def pre_step(self, state, action: jax.Array):
         state = self.env.pre_step(state, action)
         
         if 'steps' in state.info:
@@ -79,7 +77,7 @@ class AutoResetWrapper(Wrapper):
         state = state.replace(done=jnp.zeros_like(state.done))
         return state
   
-    def post_step(self, state, physics_state, sensor_data) -> State:
+    def post_step(self, state, physics_state, sensor_data):
 
         state = self.env.post_step(state, physics_state, sensor_data)
 
@@ -102,7 +100,7 @@ class VmapWrapper(Wrapper):
         super().__init__(env)
         self.batch_size = batch_size
 
-    def reset(self, rng: jax.Array) -> State:
+    def reset(self, rng: jax.Array):
         if self.batch_size is not None:
             rng = jax.random.split(rng, self.batch_size)
         return jax.vmap(self.env.reset)(rng)

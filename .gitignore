@@ -7,3 +7,4 @@ outputs/
 tmp/
 .venv
 *.npz
+logs/

@@ -6,7 +6,7 @@ from flax import struct
 from etils import epath
 from typing import Any, Dict
 
-from builderbench.constants import _TIME_STEPS
+from .constants import _TIME_STEPS
 
 @struct.dataclass
 class State:
@@ -45,7 +45,7 @@ def make_env(args):
         num_cubes = int( re.search(r"cube-(\d+)", args.env_id).group(1))
         task_id = int( re.search(r"task(\d+)", args.env_id).group(1)) - 1
 
-        from builderbench.build_block import CreativeCube, default_config
+        from .build_block import CreativeCube, default_config
         env_class = CreativeCube
         default_config = default_config()
         default_config.num_cubes = num_cubes
@@ -55,7 +55,7 @@ def make_env(args):
     elif re.fullmatch(r"cube-\d+-play", args.env_id):
         num_cubes = int( re.search(r"cube-(\d+)", args.env_id).group(1))
 
-        from builderbench.build_block_play import CreativeCubePlay, default_config
+        from .build_block_play import CreativeCubePlay, default_config
         env_class = CreativeCubePlay
         default_config = default_config()
         default_config.num_cubes = num_cubes

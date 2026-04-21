@@ -108,12 +108,12 @@ class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
 
     # logging and checkpointing
-    track: bool = False
+    track: bool = True
     wandb_project_name: str = "buildstuff"
-    wandb_entity: str = None
+    wandb_entity: str = 'nyuad-mmvc'
     wandb_mode: str = 'online'
     wandb_dir: str = './'
-    wandb_group: str = 'default'
+    wandb_group: str = 'test'
     wandb_name_tag: str = ''
 
     num_eval_steps: int = 50
