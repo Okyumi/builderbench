@@ -119,7 +119,7 @@ class Args:
     wandb_entity: str = 'nyuad_mmvc'
     wandb_mode: str = 'online'
     wandb_dir: str = './'
-    wandb_group: str = 'test'
+    wandb_group: str = 'test2'
     wandb_name_tag: str = ''
 
     num_eval_steps: int = 50

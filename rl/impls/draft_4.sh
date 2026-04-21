@@ -4,7 +4,7 @@
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=96GB
+#SBATCH --mem=64GB
 #SBATCH --partition=nvidia
 #SBATCH --output=/scratch/yd2247/builderbench/logs/continual/%A_%a.out
 #SBATCH --error=/scratch/yd2247/builderbench/logs/continual/%A_%a.err
@@ -44,7 +44,7 @@ set -euo pipefail
 # BuilderBench uses num_envs=2048 by default, which is lighter on memory
 # than the sgcrl grid. On an 80GB GPU you can typically run 4-8 in parallel.
 # Adjust if you see OOM.
-TASKS_PER_GPU="${TASKS_PER_GPU:-4}"
+TASKS_PER_GPU="${TASKS_PER_GPU:-2}"
 
 # ---- shared defaults (every experiment in the batch sees these) -----------
 # These mirror the `Args` dataclass defaults in continual_crl.py. Override
