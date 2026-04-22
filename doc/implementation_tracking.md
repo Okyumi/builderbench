@@ -2,6 +2,21 @@
 
 ## Status: Phase 6 — Batch Experiment Pipeline
 
+### Bug fix (Apr 23, 2026) — `jax.tree_map` removed in JAX 0.6
+
+- [x] Root-cause. Runs with `actor_mode=cka` or `critic_mode=cka`
+  crashed with `AttributeError: jax.tree_map was removed in JAX
+  v0.6.0`. All four live call sites were in
+  `rl/impls/knowledge_pool.py`, which backs both the actor pool and
+  the critic pool in `continual_crl.py`.
+- [x] Fix. Replace `jax.tree_map` with `jax.tree.map` in all four
+  locations: pool-merge averaging, softmax-weighted contribution,
+  checkpoint deep-copy, and `pytree_zeros_like`. No semantic change.
+- [x] Repository-wide `grep` for `jax.tree_map` across the live
+  source tree now returns zero matches.
+- [x] `doc/bug_fix_jax_tree_map.md`: full diagnosis, call-site table,
+  and post-fix smoke-test instructions.
+
 ### Bug fix (Apr 21, 2026) — observation padding dim
 
 - [x] Root-caused `flax.errors.ScopeParamShapeError (121, 1024) vs (115, 1024)` in `continual_crl.py::actor_step`: `pad_wrapper.FIXED_OBS_SUFFIX` was set to 8 but the real `finger_pos` dim is 2 (from `build_block.py:152-155`, indexing `['left_driver_joint', 'right_driver_joint']`). The actor was initialised at declared `UNIFIED_OBS_DIM = 57` but the runtime obs was 51. See `doc/bug_fix_obs_padding.md`.

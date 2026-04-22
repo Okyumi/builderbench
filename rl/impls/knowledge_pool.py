@@ -43,7 +43,7 @@ class KnowledgePool:
                     if sim > best_sim:
                         best_sim = sim
                         best_i, best_j = i, j
-            merged = jax.tree_map(
+            merged = jax.tree.map(
                 lambda a, b: (a + b) / 2.0,
                 self._vectors[best_i], self._vectors[best_j],
             )
@@ -70,7 +70,7 @@ class KnowledgePool:
         if alpha_logits is None:
             alpha_logits = jnp.zeros(n)
         alphas = jax.nn.softmax(alpha_logits * alpha_scale)
-        result = jax.tree_map(
+        result = jax.tree.map(
             lambda *vs: sum(a * v for a, v in zip(alphas, vs)),
             *self._vectors,
         )
@@ -82,7 +82,7 @@ class KnowledgePool:
     def state_dict(self):
         """Serialize pool for checkpointing."""
         return {
-            'vectors': [jax.tree_map(lambda x: x, v) for v in self._vectors],
+            'vectors': [jax.tree.map(lambda x: x, v) for v in self._vectors],
             'k_max': self.k_max,
         }
 
@@ -94,4 +94,4 @@ class KnowledgePool:
 
 def pytree_zeros_like(pytree):
     """Create a zero-valued pytree with the same structure."""
-    return jax.tree_map(jnp.zeros_like, pytree)
+    return jax.tree.map(jnp.zeros_like, pytree)
