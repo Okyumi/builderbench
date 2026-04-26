@@ -2,6 +2,38 @@
 
 ## Status: Phase 6 — Batch Experiment Pipeline
 
+### Audit (Apr 26, 2026) — CKA correctness and slowdown
+
+- [x] Cross-checked BuilderBench's CKA implementation against the
+  original CKA-RL reference (`sgcrl/cka-rl-meta-world`) and the SGCRL
+  contrastive port (`sgcrl/contrastive/{knowledge_pool,
+  continual_learning}.py`). See `doc/audit_apr26_cka_correctness.md`.
+- [x] Root cause of "`actor_mode=cka` is no better than `persistent`":
+  the learnable `alpha_logits` and `alpha_scale` are missing entirely.
+  `compute_contribution(alpha_logits=None, ...)` falls back to a
+  uniform average over the pool; `args.alpha_scale` is a Python
+  hyperparameter captured into the JIT trace. The composition is
+  therefore $\theta'_k = \theta_{\text{base}} + \frac{1}{|V|}\sum_j v_j + v_k$
+  with no learning of the attention, which is strictly worse than
+  `persistent` because the agent starts from a contaminated init
+  pulled by every prior task in equal measure.
+- [x] Root cause of slowdown: `actor_base_params` and `actor_pool_c`
+  are closed-over outside the `training_state` pytree, so the inner
+  `@jax.jit` functions are rebuilt and re-traced at every task
+  boundary. `reset` and `persistent` reuse the cached trace.
+- [ ] Fix A (priority 1, correctness): make `alpha_logits` and
+  `alpha_scale` learnable parameters in `training_state` with their
+  own optimisers (mirrors `sgcrl/contrastive/continual_learning.py:
+  beta_k, alpha_scale`).
+- [ ] Fix B (priority 1, performance): move pool vectors into
+  `training_state` as fixed-size leading-axis arrays with a mask, so
+  closures no longer capture per-task constants and the JIT trace is
+  reused across tasks.
+- [ ] Fix C: drop the seeded zero vector at task 0.
+- [ ] Fix D: vectorise `_merge_pair` cosine similarity.
+- [ ] Fix E: replace string-based head detection with explicit head
+  tagging on the actor module.
+
 ### Bug fix (Apr 23, 2026) — `jax.tree_map` removed in JAX 0.6
 
 - [x] Root-cause. Runs with `actor_mode=cka` or `critic_mode=cka`
