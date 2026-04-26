@@ -76,7 +76,18 @@ RL_ROOT = Path(__file__).resolve().parents[1]
 if str(RL_ROOT) not in sys.path:
     sys.path.insert(0, str(RL_ROOT))
 from builderbench.env_utils import make_env
-from knowledge_pool import KnowledgePool, pytree_zeros_like
+from knowledge_pool import (
+    CKAPool,
+    CKAState,
+    compose as cka_compose,
+    compute_contribution as cka_compute_contribution,
+    init_cka_state,
+    reinit_for_new_task,
+    append_vector_host,
+    pool_size,
+    pytree_zeros_like,
+    empty_pool_like,
+)
 import rl_metrics
 
 
@@ -281,11 +292,23 @@ class Actor(nn.Module):
 
 @flax.struct.dataclass
 class CRLTrainingState:
-    """Contains training state for the learner."""
+    """Contains training state for the learner.
+
+    When the actor or critic is in CKA mode, ``actor_cka`` /
+    ``critic_cka`` carry the corresponding ``CKAState`` (base, v_k,
+    pool, alpha_logits, alpha_scale). The matching ``actor_state`` /
+    ``critic_state`` then holds the optimiser state for the trainable
+    bundle ``(v_k, alpha_logits, alpha_scale)``; ``actor_state.params``
+    is a flat dict ``{'v_k': ..., 'alpha_logits': ..., 'alpha_scale':
+    ...}`` so a single Optax optimiser can update them jointly.
+    """
     env_steps: np.ndarray
     gradient_steps: np.ndarray
     actor_state: TrainState
     critic_state: TrainState
+    # CKA slots (None when not in CKA mode).
+    actor_cka: Optional[CKAState] = None
+    critic_cka: Optional[CKAState] = None
 
 
 class Transition(NamedTuple):
@@ -443,6 +466,37 @@ def _compose_params(base, pool_c, vk):
     return jax.tree_util.tree_map(lambda b, p, v: b + p + v, base, pool_c, vk)
 
 
+def _cka_trainable_init(base_params, capacity: int,
+                        alpha_scale_init: float = 1.0):
+    """Build the trainable bundle for a CKA component.
+
+    The bundle is ``{'v_k': pytree, 'alpha_logits': [capacity],
+    'alpha_scale': scalar}`` and is what a single Optax optimiser
+    updates per inner-loop step.
+    """
+    return {
+        'v_k': jax.tree.map(jnp.zeros_like, base_params),
+        'alpha_logits': jnp.zeros((capacity,), dtype=jnp.float32),
+        'alpha_scale': jnp.array(alpha_scale_init, dtype=jnp.float32),
+    }
+
+
+def _cka_compose_from_trainable(cka_state: CKAState, trainable: dict):
+    """Compose θ' = θ_base + Σ α_j v_j + v_k from a CKA state and a
+    trainable bundle (lifted out of ``actor_state.params``)."""
+    contribution = cka_compute_contribution(
+        cka_state.pool,
+        trainable['alpha_logits'],
+        trainable['alpha_scale'],
+    )
+    return jax.tree.map(
+        lambda b, p, v: b + p + v,
+        cka_state.base_params,
+        contribution,
+        trainable['v_k'],
+    )
+
+
 def _split_head_body(base_params, vk_params):
     """Split v_k into head (for pool) and body (fold into base).
 
@@ -503,25 +557,24 @@ def train_single_task(
     g_encoder: G_encoder,
     key: jax.Array,
     # CKA-specific (None when not using CKA for that component)
-    actor_base_params=None,
-    actor_pool_c=None,
-    critic_base_params=None,
-    critic_pool_c=None,
+    actor_cka: Optional[CKAState] = None,
+    critic_cka: Optional[CKAState] = None,
 ):
     """Run the inner CRL training loop for one task.
 
-    When ``actor_base_params`` is not None, the actor is in CKA mode:
-    ``actor_state.params`` represents v_k and the effective policy is
-    θ_base + pool_c + v_k.
+    When ``actor_cka`` is not None, the actor is in CKA mode:
+    ``actor_state.params`` is the trainable bundle ``{'v_k',
+    'alpha_logits', 'alpha_scale'}`` and the effective policy at every
+    step is ``compose(actor_cka, actor_state.params)``.
 
-    Same logic applies to critic with ``critic_base_params``.
+    Same logic applies to critic with ``critic_cka``.
 
     Returns:
-        (actor_state, critic_state)
+        (actor_state, critic_state, actor_cka_final, critic_cka_final)
     """
     args.env_id = task_id
-    use_actor_cka = actor_base_params is not None
-    use_critic_cka = critic_base_params is not None
+    use_actor_cka = actor_cka is not None
+    use_critic_cka = critic_cka is not None
     # Determine whether to mask body gradients
     freeze_actor_body = (use_actor_cka and args.encoder_from_base
                          and task_idx > 0)
@@ -595,6 +648,8 @@ def train_single_task(
         gradient_steps=np.zeros((), dtype=np.float64),
         actor_state=actor_state,
         critic_state=critic_state,
+        actor_cka=actor_cka,
+        critic_cka=critic_cka,
     )
 
     # ---- replay buffer -----------------------------------------------------
@@ -640,21 +695,22 @@ def train_single_task(
     )
 
     # ---- helpers to get composed params from training state ----------------
-    # These closures capture base/pool_c so the JIT-compiled functions can use
-    # them.  When not in CKA mode the "compose" is identity.
+    # No closure capture of per-task base/pool: everything lives in the
+    # training_state pytree, so JIT-compiled functions trace once and
+    # reuse the cache across tasks.
 
     def _get_actor_params(ts):
         """Return the effective (composed) actor params."""
         if use_actor_cka:
-            return _compose_params(actor_base_params, actor_pool_c,
-                                   ts.actor_state.params)
+            return _cka_compose_from_trainable(ts.actor_cka,
+                                               ts.actor_state.params)
         return ts.actor_state.params
 
     def _get_critic_params(ts):
         """Return the effective (composed) critic params."""
         if use_critic_cka:
-            return _compose_params(critic_base_params, critic_pool_c,
-                                   ts.critic_state.params)
+            return _cka_compose_from_trainable(ts.critic_cka,
+                                               ts.critic_state.params)
         return ts.critic_state.params
 
     # ---- JIT-compiled training functions -----------------------------------
@@ -721,15 +777,19 @@ def train_single_task(
             length=int(np.ceil(args.min_replay_size / args.rollout_length)))[0]
 
     # -- actor update --------------------------------------------------------
-    # When CKA: actor_state.params = v_k.  Gradients of the actor loss w.r.t.
-    # the composed policy equal gradients w.r.t. v_k (base and pool_c are
-    # constant additive terms) so we can differentiate w.r.t. v_k directly.
+    # CKA: actor_state.params is the trainable bundle
+    #   {'v_k', 'alpha_logits', 'alpha_scale'}.
+    # The composed policy is built from training_state.actor_cka (pool +
+    # base) and the bundle. The optimiser updates all three components
+    # jointly. Pool and base flow through training_state, so the JIT
+    # cache is reused across tasks.
     if use_actor_cka:
         @jax.jit
         def update_actor_and_alpha(transitions, training_state, key):
-            def actor_loss(vk_params, critic_params, transitions, key):
-                composed = _compose_params(actor_base_params, actor_pool_c,
-                                           vk_params)
+            def actor_loss(actor_trainable, cka_state, critic_params,
+                           transitions, key):
+                composed = _cka_compose_from_trainable(cka_state,
+                                                       actor_trainable)
                 state = transitions.observation
                 goal = transitions.extras['future_goal']
                 sa_encoder_params = jax.lax.stop_gradient(critic_params["sa_encoder"])
@@ -750,18 +810,48 @@ def train_single_task(
                 return jnp.mean(args.entropy_cost * log_prob - qf_pi), log_prob
 
             effective_critic = _get_critic_params(training_state)
-            (actorloss, log_prob), actor_grad = jax.value_and_grad(actor_loss, has_aux=True)(
-                training_state.actor_state.params, effective_critic,
-                transitions, key)
+            (actorloss, log_prob), grad_bundle = jax.value_and_grad(
+                actor_loss, has_aux=True)(
+                training_state.actor_state.params,
+                training_state.actor_cka,
+                effective_critic, transitions, key)
 
-            # When encoder_from_base=True, mask out body gradients so the
-            # encoder stays at base-task values.
+            # When encoder_from_base=True, mask body-of-v_k gradients so
+            # the encoder stays at base-task values. alpha_logits and
+            # alpha_scale are unaffected.
             if freeze_actor_body:
-                actor_grad = _mask_body_grads(actor_grad)
+                grad_bundle = {
+                    **grad_bundle,
+                    'v_k': _mask_body_grads(grad_bundle['v_k']),
+                }
 
-            new_actor_state = training_state.actor_state.apply_gradients(grads=actor_grad)
+            new_actor_state = training_state.actor_state.apply_gradients(
+                grads=grad_bundle)
             training_state = training_state.replace(actor_state=new_actor_state)
-            return training_state, {"sample_entropy": -log_prob, "actor_loss": actorloss}
+
+            # Track scalar diagnostics on alpha for logging.
+            alpha_softmax = jax.nn.softmax(
+                jnp.where(
+                    training_state.actor_cka.pool.mask,
+                    training_state.actor_state.params['alpha_logits']
+                    * training_state.actor_state.params['alpha_scale'],
+                    -jnp.inf,
+                ),
+                axis=0,
+            )
+            alpha_softmax = jnp.where(
+                jnp.any(training_state.actor_cka.pool.mask),
+                alpha_softmax, jnp.zeros_like(alpha_softmax),
+            )
+            return training_state, {
+                "sample_entropy": -log_prob,
+                "actor_loss": actorloss,
+                "actor_alpha_max": jnp.max(alpha_softmax),
+                "actor_alpha_entropy": -jnp.sum(
+                    alpha_softmax * jnp.log(alpha_softmax + 1e-12)),
+                "actor_alpha_scale": training_state.actor_state.params[
+                    'alpha_scale'],
+            }
     else:
         @jax.jit
         def update_actor_and_alpha(transitions, training_state, key):
@@ -822,15 +912,37 @@ def train_single_task(
                 return c_loss, (logsumexp, correct, logits_pos, logits_neg)
 
             (loss, (logsumexp, correct, logits_pos, logits_neg)), grad = jax.value_and_grad(
-                critic_loss, has_aux=True)(training_state.critic_state.params, transitions, key)
+                critic_loss, has_aux=True)(
+                training_state.critic_state.params,
+                training_state.critic_cka,
+                transitions, key)
             new_critic_state = training_state.critic_state.apply_gradients(grads=grad)
             training_state = training_state.replace(critic_state=new_critic_state)
+
+            alpha_softmax = jax.nn.softmax(
+                jnp.where(
+                    training_state.critic_cka.pool.mask,
+                    training_state.critic_state.params['alpha_logits']
+                    * training_state.critic_state.params['alpha_scale'],
+                    -jnp.inf,
+                ),
+                axis=0,
+            )
+            alpha_softmax = jnp.where(
+                jnp.any(training_state.critic_cka.pool.mask),
+                alpha_softmax, jnp.zeros_like(alpha_softmax),
+            )
             return training_state, {
                 "categorical_accuracy": jnp.mean(correct),
                 "logits_pos": logits_pos,
                 "logits_neg": logits_neg,
                 "logsumexp": logsumexp.mean(),
                 "critic_loss": loss,
+                "critic_alpha_max": jnp.max(alpha_softmax),
+                "critic_alpha_entropy": -jnp.sum(
+                    alpha_softmax * jnp.log(alpha_softmax + 1e-12)),
+                "critic_alpha_scale": training_state.critic_state.params[
+                    'alpha_scale'],
             }
     else:
         @jax.jit
@@ -1045,7 +1157,8 @@ def train_single_task(
 
     print(f'  Task {task_idx} [{task_id}] training complete.', flush=True)
 
-    return training_state.actor_state, training_state.critic_state
+    return (training_state.actor_state, training_state.critic_state,
+            training_state.actor_cka, training_state.critic_cka)
 
 
 # ---------------------------------------------------------------------------
@@ -1115,12 +1228,17 @@ def main(args: Args):
     fresh_g_params = g_encoder.init(g_key, np.ones([1, goal_size]))
 
     # ---- continual state ---------------------------------------------------
-    prev_actor_params = None       # full (composed) actor params from prev task
-    prev_critic_params = None      # full (composed) critic params from prev task
-    actor_base_params = None       # frozen base (CKA actor)
-    critic_base_params = None      # frozen base (CKA critic)
-    actor_pool = KnowledgePool(k_max=args.k_max)
-    critic_pool = KnowledgePool(k_max=args.k_max)
+    # CKA pool capacity: K_max + 1 so a new vector can be appended before
+    # the merge step is invoked.
+    cka_capacity = args.k_max + 1
+    prev_actor_params = None    # full (composed) actor params from prev task
+    prev_critic_params = None   # full (composed) critic params from prev task
+    # CKAState containers for actor and critic. None when not in CKA mode
+    # for that component. After task 0, the CKA state holds base_params,
+    # the pool of past v_k's, and (re-initialised at every task) the
+    # trainable alpha_logits / alpha_scale.
+    actor_cka_state: Optional[CKAState] = None
+    critic_cka_state: Optional[CKAState] = None
 
     # ---- restore state from checkpoint if resuming -------------------------
     if start_task > 0:
@@ -1131,15 +1249,9 @@ def main(args: Args):
         prev_actor_params = ckpt['actor_params']
         prev_critic_params = ckpt['critic_params']
         if args.actor_mode == 'cka':
-            actor_base_params = ckpt.get('actor_base_params')
-            pool_state = ckpt.get('actor_pool')
-            if pool_state is not None:
-                actor_pool.load_state_dict(pool_state)
+            actor_cka_state = ckpt.get('actor_cka_state')
         if args.critic_mode == 'cka':
-            critic_base_params = ckpt.get('critic_base_params')
-            pool_state = ckpt.get('critic_pool')
-            if pool_state is not None:
-                critic_pool.load_state_dict(pool_state)
+            critic_cka_state = ckpt.get('critic_cka_state')
 
     # ---- task loop ---------------------------------------------------------
     for task_idx in range(start_task, num_tasks):
@@ -1148,45 +1260,53 @@ def main(args: Args):
         print(f'\n{"=" * 60}')
         print(f'Task {task_idx}/{num_tasks - 1}: {task_id}')
         print(f'Actor mode: {args.actor_mode} | Critic mode: {args.critic_mode}')
-        if args.actor_mode == 'cka':
-            print(f'Actor pool: {len(actor_pool)}/{args.k_max}')
-        if args.critic_mode == 'cka':
-            print(f'Critic pool: {len(critic_pool)}/{args.k_max}')
+        if args.actor_mode == 'cka' and actor_cka_state is not None:
+            print(f'Actor pool: {int(jnp.sum(actor_cka_state.pool.mask))}/{args.k_max}')
+        if args.critic_mode == 'cka' and critic_cka_state is not None:
+            print(f'Critic pool: {int(jnp.sum(critic_cka_state.pool.mask))}/{args.k_max}')
         print(f'{"=" * 60}\n')
 
         key, task_key = jax.random.split(key)
 
-        # ---- determine actor params for this task --------------------------
-        # For CKA: actor_state.params = v_k (zero-init), base/pool_c passed
-        #          to train_single_task.
-        # For others: actor_state.params = full policy params.
-        cka_actor_base = None   # passed to train_single_task
-        cka_actor_pool_c = None
-        cka_critic_base = None
-        cka_critic_pool_c = None
+        # ---- decide what the inner loop trains -----------------------------
+        # Non-CKA modes train the full policy params (or critic params).
+        # CKA modes train the bundle {'v_k', 'alpha_logits', 'alpha_scale'},
+        # with the frozen base_params and pool living in actor_cka_state /
+        # critic_cka_state. Both flow through the JAX training_state pytree,
+        # so the @jax.jit-decorated inner functions trace once and reuse the
+        # cache across tasks.
+        actor_cka_for_task: Optional[CKAState] = None
+        critic_cka_for_task: Optional[CKAState] = None
 
+        # --- actor params for this task ---
         if task_idx == 0:
             actor_params = fresh_actor_params
         elif args.actor_mode == 'reset':
             key, reinit_key = jax.random.split(key)
-            actor_params = actor.init(reinit_key, np.ones([1, obs_size]), np.ones([1, args.rep_size]))
+            actor_params = actor.init(reinit_key, np.ones([1, obs_size]),
+                                      np.ones([1, args.rep_size]))
         elif args.actor_mode == 'persistent':
             assert prev_actor_params is not None
             actor_params = prev_actor_params
         elif args.actor_mode == 'cka':
-            if task_idx == 0:
-                # Task 0: train from scratch (base will be set after)
-                actor_params = fresh_actor_params
-            else:
-                assert actor_base_params is not None
-                cka_actor_base = actor_base_params
-                # Compute pool contribution (uniform blending)
-                cka_actor_pool_c = actor_pool.compute_contribution(
-                    alpha_logits=None, alpha_scale=args.alpha_scale)
-                if cka_actor_pool_c is None:
-                    cka_actor_pool_c = pytree_zeros_like(actor_base_params)
-                # v_k starts as zeros
-                actor_params = pytree_zeros_like(actor_base_params)
+            assert actor_cka_state is not None, (
+                'actor CKA state must be set after task 0')
+            # Refresh trainables (v_k, alpha_logits, alpha_scale) for the
+            # new task. base_params and pool are inherited from the
+            # previous task's CKA state.
+            key, alpha_key = jax.random.split(key)
+            actor_cka_for_task = reinit_for_new_task(
+                actor_cka_state,
+                actor_cka_state.base_params,
+                alpha_key,
+                alpha_scale_init=args.alpha_scale,
+            )
+            # The TrainState wraps the trainable bundle.
+            actor_params = {
+                'v_k': actor_cka_for_task.v_k,
+                'alpha_logits': actor_cka_for_task.alpha_logits,
+                'alpha_scale': actor_cka_for_task.alpha_scale,
+            }
 
         actor_state = TrainState.create(
             apply_fn=actor.apply,
@@ -1194,7 +1314,7 @@ def main(args: Args):
             tx=optax.adam(learning_rate=args.actor_learning_rate),
         )
 
-        # ---- determine critic params for this task ------------------------
+        # --- critic params for this task ---
         if task_idx == 0:
             critic_params = {
                 "sa_encoder": fresh_sa_params,
@@ -1203,27 +1323,30 @@ def main(args: Args):
         elif args.critic_mode == 'reset':
             key, sa_reinit_key, g_reinit_key = jax.random.split(key, 3)
             critic_params = {
-                "sa_encoder": sa_encoder.init(sa_reinit_key, np.ones([1, obs_size]), np.ones([1, action_size])),
-                "g_encoder": g_encoder.init(g_reinit_key, np.ones([1, goal_size])),
+                "sa_encoder": sa_encoder.init(
+                    sa_reinit_key, np.ones([1, obs_size]),
+                    np.ones([1, action_size])),
+                "g_encoder": g_encoder.init(
+                    g_reinit_key, np.ones([1, goal_size])),
             }
         elif args.critic_mode == 'persistent':
             assert prev_critic_params is not None
             critic_params = prev_critic_params
         elif args.critic_mode == 'cka':
-            if task_idx == 0:
-                critic_params = {
-                    "sa_encoder": fresh_sa_params,
-                    "g_encoder": fresh_g_params,
-                }
-            else:
-                assert critic_base_params is not None
-                cka_critic_base = critic_base_params
-                cka_critic_pool_c = critic_pool.compute_contribution(
-                    alpha_logits=None, alpha_scale=args.alpha_scale)
-                if cka_critic_pool_c is None:
-                    cka_critic_pool_c = pytree_zeros_like(critic_base_params)
-                # w_k starts as zeros
-                critic_params = pytree_zeros_like(critic_base_params)
+            assert critic_cka_state is not None, (
+                'critic CKA state must be set after task 0')
+            key, alpha_key = jax.random.split(key)
+            critic_cka_for_task = reinit_for_new_task(
+                critic_cka_state,
+                critic_cka_state.base_params,
+                alpha_key,
+                alpha_scale_init=args.alpha_scale,
+            )
+            critic_params = {
+                'v_k': critic_cka_for_task.v_k,
+                'alpha_logits': critic_cka_for_task.alpha_logits,
+                'alpha_scale': critic_cka_for_task.alpha_scale,
+            }
 
         critic_state = TrainState.create(
             apply_fn=None,
@@ -1254,72 +1377,84 @@ def main(args: Args):
                 trigger_sync = TriggerWandbSyncHook()
 
         # ---- train -----------------------------------------------------------
-        actor_state, critic_state = train_single_task(
-            args=args,
-            task_idx=task_idx,
-            task_id=task_id,
-            actor_state=actor_state,
-            critic_state=critic_state,
-            actor=actor,
-            sa_encoder=sa_encoder,
-            g_encoder=g_encoder,
-            key=task_key,
-            actor_base_params=cka_actor_base,
-            actor_pool_c=cka_actor_pool_c,
-            critic_base_params=cka_critic_base,
-            critic_pool_c=cka_critic_pool_c,
+        actor_state, critic_state, actor_cka_for_task, critic_cka_for_task = (
+            train_single_task(
+                args=args,
+                task_idx=task_idx,
+                task_id=task_id,
+                actor_state=actor_state,
+                critic_state=critic_state,
+                actor=actor,
+                sa_encoder=sa_encoder,
+                g_encoder=g_encoder,
+                key=task_key,
+                actor_cka=actor_cka_for_task,
+                critic_cka=critic_cka_for_task,
+            )
         )
 
-        # ---- post-task: carry forward / update pools -----------------------
-        # Snapshot composed policy BEFORE modifying pool/base
-        composed_actor = (_compose_params(cka_actor_base, cka_actor_pool_c,
-                                          actor_state.params)
-                          if cka_actor_base is not None
-                          else actor_state.params)
+        # ---- post-task: carry forward / update CKA states ------------------
+        # Snapshot the composed policy / critic BEFORE updating base+pool.
+        if actor_cka_for_task is not None:
+            composed_actor = _cka_compose_from_trainable(
+                actor_cka_for_task, actor_state.params)
+        else:
+            composed_actor = actor_state.params
+
+        if critic_cka_for_task is not None:
+            composed_critic = _cka_compose_from_trainable(
+                critic_cka_for_task, critic_state.params)
+        else:
+            composed_critic = critic_state.params
 
         if args.actor_mode == 'cka':
             if task_idx == 0:
-                # Freeze base after task 0: base = trained policy
-                actor_base_params = actor_state.params
-                # Initialise pool with zero vector (matches SGCRL)
-                actor_pool.append(pytree_zeros_like(actor_base_params))
+                # After task 0: freeze base = trained policy. Initialise an
+                # empty CKA state (no zero seed: alpha is learnable, but a
+                # genuinely empty pool is cleaner).
+                actor_cka_state = init_cka_state(
+                    base_params=actor_state.params,
+                    capacity=cka_capacity,
+                    alpha_scale_init=args.alpha_scale,
+                )
                 prev_actor_params = actor_state.params  # composed = base
             else:
-                # actor_state.params IS v_k (the trained delta)
-                v_k = actor_state.params
+                # actor_state.params holds the trained {'v_k', alpha_logits,
+                # alpha_scale}. Snapshot v_k (optionally head-only), append
+                # to the pool, fold body into base if requested.
+                v_k = actor_state.params['v_k']
 
                 if args.adapt_heads_only:
-                    # Split v_k: fold body into base, store only head in pool
-                    actor_base_params, v_k_head_only = _split_head_body(
-                        actor_base_params, v_k)
-                    actor_pool.append(v_k_head_only)
+                    new_base, v_k_head = _split_head_body(
+                        actor_cka_state.base_params, v_k)
+                    new_pool = append_vector_host(
+                        actor_cka_state.pool, v_k_head, k_max=args.k_max)
+                    actor_cka_state = actor_cka_state.replace(
+                        base_params=new_base, pool=new_pool)
                 else:
-                    # Full-policy adaptation: base unchanged, full v_k to pool
-                    actor_pool.append(v_k)
+                    new_pool = append_vector_host(
+                        actor_cka_state.pool, v_k, k_max=args.k_max)
+                    actor_cka_state = actor_cka_state.replace(pool=new_pool)
 
-                # Compose full params for eval/checkpoint
                 prev_actor_params = composed_actor
         elif args.actor_mode == 'persistent':
-            # Carry forward composed policy for next task
             prev_actor_params = composed_actor
         else:
-            # Reset: just save for checkpoint
             prev_actor_params = actor_state.params
-
-        # Critic post-task
-        composed_critic = (_compose_params(cka_critic_base, cka_critic_pool_c,
-                                           critic_state.params)
-                           if cka_critic_base is not None
-                           else critic_state.params)
 
         if args.critic_mode == 'cka':
             if task_idx == 0:
-                critic_base_params = critic_state.params
-                critic_pool.append(pytree_zeros_like(critic_base_params))
+                critic_cka_state = init_cka_state(
+                    base_params=critic_state.params,
+                    capacity=cka_capacity,
+                    alpha_scale_init=args.alpha_scale,
+                )
                 prev_critic_params = critic_state.params
             else:
-                w_k = critic_state.params
-                critic_pool.append(w_k)
+                w_k = critic_state.params['v_k']
+                new_pool = append_vector_host(
+                    critic_cka_state.pool, w_k, k_max=args.k_max)
+                critic_cka_state = critic_cka_state.replace(pool=new_pool)
                 prev_critic_params = composed_critic
         else:
             prev_critic_params = composed_critic
@@ -1332,11 +1467,9 @@ def main(args: Args):
             'task_id': task_id,
         }
         if args.actor_mode == 'cka':
-            ckpt_data['actor_base_params'] = actor_base_params
-            ckpt_data['actor_pool'] = actor_pool.state_dict()
+            ckpt_data['actor_cka_state'] = actor_cka_state
         if args.critic_mode == 'cka':
-            ckpt_data['critic_base_params'] = critic_base_params
-            ckpt_data['critic_pool'] = critic_pool.state_dict()
+            ckpt_data['critic_cka_state'] = critic_cka_state
         save_ckpt(args.checkpoint_dir, task_idx,
                   args.actor_mode, args.critic_mode,
                   args.adapt_heads_only, args.seed, ckpt_data)

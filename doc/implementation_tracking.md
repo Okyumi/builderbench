@@ -2,6 +2,45 @@
 
 ## Status: Phase 6 — Batch Experiment Pipeline
 
+### Fix A + B (Apr 26, 2026) — learnable α and JIT trace reuse
+
+- [x] Replaced the old `KnowledgePool` Python class with a JAX-friendly
+  pool data flow (`CKAPool` + `CKAState` Flax structs); pool vectors
+  now live as a pytree with leading axis `K_max + 1` plus a boolean
+  mask of active slots, so the entire pool can sit inside the JAX
+  `training_state` and feed JIT-compiled inner functions.
+- [x] Made `alpha_logits` (length `K_max + 1`) and `alpha_scale`
+  (scalar) into per-task learnable parameters. They sit inside the
+  trainable bundle `{'v_k', 'alpha_logits', 'alpha_scale'}` that the
+  actor's (resp. critic's) Adam optimiser updates jointly. The
+  gradient through `(alpha_logits, alpha_scale)` flows via the masked
+  softmax in `compute_contribution`.
+- [x] Removed the closure capture of `actor_base_params` /
+  `actor_pool_c` / `critic_base_params` / `critic_pool_c` from the
+  inner-loop `@jax.jit` functions; everything reaches them through
+  `training_state.actor_cka` / `training_state.critic_cka`. The inner
+  functions are now built once per process; the JIT cache is reused
+  across all tasks.
+- [x] Vectorised the cosine-similarity merge (`_merge_most_similar_pair_host`
+  in `knowledge_pool.py`); replaced the previous nested Python loop
+  with one matmul. The merge runs only at task boundaries.
+- [x] Dropped the seeded zero vector at task 0 (the original code
+  appended a zero-valued knowledge vector that, under uniform-α,
+  permanently halved every later pool contribution).
+- [x] Added W&B-logged α diagnostics: `actor_alpha_max`,
+  `actor_alpha_entropy`, `actor_alpha_scale`, and the symmetric
+  critic series. A flat curve here would indicate the optimiser is
+  ignoring α.
+- [x] Smoke tests on a toy actor confirm gradients flow through `v_k`
+  alone (single-active-slot pool), and through `(v_k, alpha_logits,
+  alpha_scale)` (two-active-slot pool). Two slots produce
+  equal-and-opposite logit gradients summing to zero, the standard
+  softmax property.
+- [x] `doc/fix_apr26_cka_a_b.md`: full write-up.
+- [x] Acceptance criteria for the next run: `cka` matches or exceeds
+  `persistent` by end of task 1; per-task wall-clock within 10–20%
+  of `persistent`; α series non-uniform and drifting.
+
 ### Audit (Apr 26, 2026) — CKA correctness and slowdown
 
 - [x] Cross-checked BuilderBench's CKA implementation against the
