@@ -886,12 +886,18 @@ def train_single_task(
             return training_state, {"sample_entropy": -log_prob, "actor_loss": actorloss}
 
     # -- critic update -------------------------------------------------------
+    # CKA: critic_state.params is the trainable bundle
+    #   {'v_k', 'alpha_logits', 'alpha_scale'}.
+    # The composed critic is built from training_state.critic_cka (pool +
+    # base) and the bundle. The optimiser updates all three components
+    # jointly. Pool and base flow through training_state, so the JIT
+    # cache is reused across tasks. Mirrors the actor CKA path above.
     if use_critic_cka:
         @jax.jit
         def update_critic(transitions, training_state, key):
-            def critic_loss(wk_params, transitions, key):
-                composed = _compose_params(critic_base_params, critic_pool_c,
-                                           wk_params)
+            def critic_loss(critic_trainable, cka_state, transitions, key):
+                composed = _cka_compose_from_trainable(cka_state,
+                                                       critic_trainable)
                 sa_encoder_params = composed["sa_encoder"]
                 g_encoder_params = composed["g_encoder"]
 
@@ -914,12 +920,12 @@ def train_single_task(
                 logits_neg = jnp.sum(logits * (1 - I)) / jnp.sum(1 - I)
                 return c_loss, (logsumexp, correct, logits_pos, logits_neg)
 
-            (loss, (logsumexp, correct, logits_pos, logits_neg)), grad = jax.value_and_grad(
+            (loss, (logsumexp, correct, logits_pos, logits_neg)), grad_bundle = jax.value_and_grad(
                 critic_loss, has_aux=True)(
                 training_state.critic_state.params,
                 training_state.critic_cka,
                 transitions, key)
-            new_critic_state = training_state.critic_state.apply_gradients(grads=grad)
+            new_critic_state = training_state.critic_state.apply_gradients(grads=grad_bundle)
             training_state = training_state.replace(critic_state=new_critic_state)
 
             alpha_softmax = jax.nn.softmax(
