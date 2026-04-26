@@ -94,17 +94,13 @@ import rl_metrics
 # ---------------------------------------------------------------------------
 # Flax Actor head/body detection
 # ---------------------------------------------------------------------------
-# The Flax Actor uses @nn.compact with auto-naming:
-#   Dense_0 .. Dense_3 (1024-width)  → body
-#   LayerNorm_0 .. LayerNorm_3       → body
-#   Dense_4 (mean projection)        → head
-#   Dense_5 (log_std projection)     → head
-#
-# A param leaf's *path* (from tree_flatten_with_path) looks like:
-#   ('params', 'Dense_4', 'kernel')  or  ('params', 'Dense_5', 'bias')
-# We detect head leaves by checking for 'Dense_4' or 'Dense_5' in the path.
-
-ACTOR_HEAD_LAYER_NAMES = ('Dense_4', 'Dense_5')
+# Heads on the Actor module are explicitly named ``mean_head`` and
+# ``log_std_head`` (see ``Actor.__call__`` below). CKA's
+# ``adapt_heads_only`` mode classifies a parameter leaf as 'head' if its
+# Flax path traverses one of these names. Tagging by name (rather than by
+# auto-numbered ``Dense_4``/``Dense_5``) means head/body identification
+# stays correct even if body layers are added or removed.
+ACTOR_HEAD_LAYER_NAMES = ('mean_head', 'log_std_head')
 
 
 def _is_actor_head_leaf(path) -> bool:
@@ -277,8 +273,15 @@ class Actor(nn.Module):
         x = normalize(x)
         x = nn.swish(x)
 
-        mean = nn.Dense(self.action_size, kernel_init=lecun_unfirom, bias_init=bias_init)(x)     # Dense_4 (HEAD)
-        log_std = nn.Dense(self.action_size, kernel_init=lecun_unfirom, bias_init=bias_init)(x)   # Dense_5 (HEAD)
+        # Heads are named explicitly so head/body classification does not
+        # depend on the body's auto-numbered Dense_* indices. CKA's
+        # adapt_heads_only mode keys off these names.
+        mean = nn.Dense(self.action_size, kernel_init=lecun_unfirom,
+                        bias_init=bias_init,
+                        name='mean_head')(x)
+        log_std = nn.Dense(self.action_size, kernel_init=lecun_unfirom,
+                           bias_init=bias_init,
+                           name='log_std_head')(x)
 
         log_std = nn.tanh(log_std)
         log_std = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX - self.LOG_STD_MIN) * (log_std + 1)
