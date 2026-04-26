@@ -9,7 +9,7 @@
 #SBATCH --output=/scratch/yd2247/builderbench/logs/continual/%A_%a.out
 #SBATCH --error=/scratch/yd2247/builderbench/logs/continual/%A_%a.err
 #SBATCH --mail-user=yd2247@nyu.edu
-#SBATCH --array=0-4
+#SBATCH --array=0-5
 
 # ==========================================================================
 # BuilderBench Continual CRL -- Batch SLURM Launcher
