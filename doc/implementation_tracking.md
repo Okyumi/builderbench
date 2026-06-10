@@ -331,13 +331,28 @@ Major additions:
 - Created `doc/implementation_tracking.md`
 - Created `rl/impls/continual_crl.py`
 
+### 2026-06-09 (DCC port)
+
+- Added `rl/impls/decomposed_networks.py` (Flax port of sgcrl's
+  decomposed-critic networks).
+- Added `rl/impls/continual_crl_dcc.py` driver. Parallels
+  `continual_crl.py` but uses the decomposed critic family. Existing
+  driver, knowledge_pool, rl_metrics, and SLURM scripts untouched.
+- Added `rl/impls/experiment_configs_dcc.py` ablation enumerator.
+- Added `rl/impls/draft_dcc.sh` SLURM launcher.
+- Documented in `doc/2026-06-09_dcc_port.md`.
+
 ---
 
 ## File Inventory
 
 | File | Purpose | Status |
 |---|---|---|
-| `rl/impls/continual_crl.py` | Main continual training driver | Complete |
+| `rl/impls/continual_crl.py` | Main continual training driver (R/P/C grid) | Complete |
+| `rl/impls/continual_crl_dcc.py` | Decomposed Contrastive Critic driver | Complete |
+| `rl/impls/decomposed_networks.py` | DCC critic networks (Flax) | Complete |
+| `rl/impls/experiment_configs_dcc.py` | DCC ablation enumerator | Complete |
+| `rl/impls/draft_dcc.sh` | DCC SLURM launcher | Complete |
 | `rl/impls/knowledge_pool.py` | KnowledgePool with cosine-similarity merging | Complete |
 | `rl/impls/rl_metrics.py` | RL representation metrics (Flax) | Complete |
 | `rl/impls/utils/pad_wrapper.py` | Observation/goal padding wrapper | Complete |
