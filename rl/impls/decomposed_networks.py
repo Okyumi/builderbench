@@ -187,9 +187,11 @@ class DecomposedCriticNetworks:
     use_dyn: bool                # whether the dyn loss is active
 
     # Convenience apply functions over the FULL param dict.
-    apply_sa_repr: Callable      # (params_dict, obs, action) -> z_sa
-    apply_g_repr: Callable       # (params_dict, goal) -> z_g
-    apply_h_dyn: Callable        # (params_dict, obs, action) -> dynamics prediction
+    apply_sa_repr: Callable          # (params_dict, obs, action) -> z_sa
+    apply_sa_shared_repr: Callable   # h_phi(b_shared(s, a))  -> z_shared
+    apply_sa_task_repr: Callable     # phi_task(s, a)         -> z_task
+    apply_g_repr: Callable           # (params_dict, goal) -> z_g
+    apply_h_dyn: Callable            # (params_dict, obs, action) -> dynamics pred
 
 
 # ---------------------------------------------------------------------------
@@ -330,15 +332,23 @@ def make_decomposed_networks(
 
     # ---- Apply functions over a single params dict ----
 
+    def apply_sa_shared_repr(params, obs, action):
+        """Return z_shared = h_phi(b_shared(s, a)) with shape (B, rep_size)."""
+        hidden = b_shared.apply(params['b_shared'], obs, action)
+        return h_phi.apply(params['h_phi'], hidden)
+
+    def apply_sa_task_repr(params, obs, action):
+        """Return z_task = phi_task(s, a) with shape (B, rep_size)."""
+        return phi_task.apply(params['phi_task'], obs, action)
+
     def apply_sa_repr(params, obs, action):
         """Return z_sa with shape (B, z_sa_dim).
 
         `params` is a dict containing 'b_shared', 'h_phi', 'phi_task'.
         Any other entries are ignored.
         """
-        hidden = b_shared.apply(params['b_shared'], obs, action)
-        z_shared = h_phi.apply(params['h_phi'], hidden)
-        z_task = phi_task.apply(params['phi_task'], obs, action)
+        z_shared = apply_sa_shared_repr(params, obs, action)
+        z_task = apply_sa_task_repr(params, obs, action)
         if combine_mode == 'add':
             return z_shared + z_task
         # 'concat'
@@ -391,6 +401,8 @@ def make_decomposed_networks(
         goal_encoder_mode=goal_encoder_mode,
         use_dyn=use_dyn,
         apply_sa_repr=apply_sa_repr,
+        apply_sa_shared_repr=apply_sa_shared_repr,
+        apply_sa_task_repr=apply_sa_task_repr,
         apply_g_repr=apply_g_repr,
         apply_h_dyn=apply_h_dyn_fn,
     )

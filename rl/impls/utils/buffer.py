@@ -141,7 +141,29 @@ class TrajectoryUniformSamplingQueue():
             action=jnp.squeeze(transition.action[:-1]),
             extras=extras,
         )
-    
+
+    @staticmethod
+    @functools.partial(jax.jit, static_argnames=("buffer_config"))
+    def flatten_crl_dcc_fn(buffer_config, transition, sample_key):
+        """CRL HER flatten plus ``next_observation`` for DCC dynamics loss.
+
+        DCC (Algorithm 1) needs tuples ``(s, a, g, s')`` after HER
+        relabelling. ``flatten_crl_fn`` already produces ``s``, ``a``, and
+        ``g`` (as ``extras['future_goal']``). The dynamics auxiliary
+        ``L_dyn = || h_dyn(b_shared(s, a)) - s'_M ||^2`` additionally
+        needs ``s'``, aligned with each retained timestep.
+
+        Because ``flatten_crl_fn`` sets ``observation = seq[:-1]``, the
+        matching next state is ``seq[1:]``. We attach that here rather
+        than in the baseline flatten so ``continual_crl.py`` stays
+        bit-identical.
+        """
+        flat = TrajectoryUniformSamplingQueue.flatten_crl_fn(
+            buffer_config, transition, sample_key)
+        extras = dict(flat.extras)
+        extras["next_observation"] = transition.observation[1:]
+        return flat._replace(extras=extras)
+
     @staticmethod
     @functools.partial(jax.jit, static_argnames=("buffer_config"))
     def flatten_sac_her_fn(buffer_config, transition, sample_key):

@@ -145,12 +145,15 @@ def extract_critic_features(sa_encoder, g_encoder, critic_params, obs, actions, 
 
 
 def _get_encoder_final_kernel(encoder_params, encoder_name='sa_encoder'):
-    """Extract the final Dense layer's kernel from a Flax encoder.
+    """Extract the final projection kernel from a Flax encoder param tree.
 
-    Flax keys: {'params': {'Dense_0': {'kernel': ...}, ..., 'Dense_4': {'kernel': ...}}}
-    We want the highest-indexed Dense layer's kernel.
+    Handles residual MLPs (``Dense_0`` … ``Dense_N``) and single-head
+    modules that name their output layer ``out`` (DCC ``h_phi``, ``phi_task``).
     """
     p = encoder_params.get('params', encoder_params)
+    if 'out' in p and isinstance(p['out'], dict) and 'kernel' in p['out']:
+        return p['out']['kernel']
+
     best_w = None
     best_idx = -1
     for key in p:
@@ -158,7 +161,6 @@ def _get_encoder_final_kernel(encoder_params, encoder_name='sa_encoder'):
         if 'Dense' in key_str:
             node = p[key]
             if isinstance(node, dict) and 'kernel' in node:
-                # Extract index: 'Dense_0' -> 0, 'Dense_4' -> 4
                 parts = key_str.split('_')
                 try:
                     idx = int(parts[-1])
@@ -168,6 +170,23 @@ def _get_encoder_final_kernel(encoder_params, encoder_name='sa_encoder'):
                     best_idx = idx
                     best_w = node['kernel']
     return best_w
+
+
+def _append_feature_metrics(
+    metrics, prefix, features, level, nrc1_target_dim,
+    final_kernel=None,
+):
+    """Add frequent + occasional feature metrics under ``prefix``."""
+    metrics[f'{prefix}/entropy'] = feature_entropy(features)
+    metrics[f'{prefix}/gini'] = gini_sparsity(features)
+    if level != 'occasional':
+        return
+    metrics[f'{prefix}/feature_rank'] = feature_rank(features, tau=0.99)
+    metrics[f'{prefix}/nrc1'] = compute_nrc1(features, target_dim=nrc1_target_dim)
+    if final_kernel is not None:
+        metrics[f'{prefix}/nrc2'] = compute_nrc2(features, final_kernel)
+    metrics[f'{prefix}/dormant_ratio'] = dormant_ratio(
+        features, dormant_pct=1e-5)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -199,28 +218,91 @@ def compute_all_metrics(
     sa_feats, g_feats = extract_critic_features(
         sa_encoder, g_encoder, critic_params, obs_batch, action_batch, goal_batch)
 
-    # Feature entropy and Gini
-    metrics['critic_sa/entropy'] = feature_entropy(sa_feats)
-    metrics['critic_g/entropy'] = feature_entropy(g_feats)
-    metrics['critic_sa/gini'] = gini_sparsity(sa_feats)
-    metrics['critic_g/gini'] = gini_sparsity(g_feats)
+    _append_feature_metrics(
+        metrics, 'critic_sa', sa_feats, level, action_dim,
+        final_kernel=_get_encoder_final_kernel(critic_params.get('sa_encoder', {})),
+    )
+    _append_feature_metrics(
+        metrics, 'critic_g', g_feats, level, nrc1_target_dim=1,
+        final_kernel=_get_encoder_final_kernel(critic_params.get('g_encoder', {})),
+    )
 
-    if level == 'occasional':
-        # ---- OCCASIONAL ----
-        metrics['critic_sa/feature_rank'] = feature_rank(sa_feats, tau=0.99)
-        metrics['critic_g/feature_rank'] = feature_rank(g_feats, tau=0.99)
+    return metrics
 
-        metrics['critic_sa/nrc1'] = compute_nrc1(sa_feats, target_dim=action_dim)
-        metrics['critic_g/nrc1'] = compute_nrc1(g_feats, target_dim=1)
 
-        sa_final_w = _get_encoder_final_kernel(critic_params.get('sa_encoder', {}))
-        g_final_w = _get_encoder_final_kernel(critic_params.get('g_encoder', {}))
-        if sa_final_w is not None:
-            metrics['critic_sa/nrc2'] = compute_nrc2(sa_feats, sa_final_w)
-        if g_final_w is not None:
-            metrics['critic_g/nrc2'] = compute_nrc2(g_feats, g_final_w)
+def compute_all_metrics_dcc(
+    decomp,
+    actor_params,
+    critic_params,
+    obs_batch,
+    action_batch,
+    goal_batch,
+    action_dim,
+    level='frequent',
+):
+    """Representation metrics for the decomposed contrastive critic.
 
-        metrics['critic_sa/dormant_ratio'] = dormant_ratio(sa_feats, dormant_pct=1e-5)
-        metrics['critic_g/dormant_ratio'] = dormant_ratio(g_feats, dormant_pct=1e-5)
+    Logs separate feature tracks for the two state-action branches in DCC:
+
+      * ``critic_sa_shared`` — z_shared = h_phi(b_shared(s, a))  (carried)
+      * ``critic_sa_task``   — z_task  = phi_task(s, a)         (reset/task)
+      * ``critic_sa_combined`` — z_sa used for contrastive scoring
+      * ``critic_g`` — z_g = psi(g)
+
+    Per-module weight norms (``critic/b_shared``, ``critic/h_phi``, …) help
+    track plasticity on each continual-transfer group.
+    """
+    metrics = {}
+
+    metrics['actor/weight_norm'] = weight_norm_l2(actor_params)
+    metrics['actor/final_layer_norm'] = final_layer_norm(actor_params)
+    metrics['critic/weight_norm'] = weight_norm_l2(critic_params)
+
+    for key in ('b_shared', 'h_phi', 'phi_task', 'h_dyn', 'psi_shared',
+                'psi_task', 'psi_proj'):
+        if key in critic_params:
+            metrics[f'critic/{key}/weight_norm'] = weight_norm_l2(
+                critic_params[key])
+
+    z_shared = decomp.apply_sa_shared_repr(critic_params, obs_batch, action_batch)
+    z_task = decomp.apply_sa_task_repr(critic_params, obs_batch, action_batch)
+    z_sa = decomp.apply_sa_repr(critic_params, obs_batch, action_batch)
+    z_g = decomp.apply_g_repr(critic_params, goal_batch)
+
+    h_phi_w = _get_encoder_final_kernel(critic_params.get('h_phi', {}))
+    phi_task_w = _get_encoder_final_kernel(critic_params.get('phi_task', {}))
+    psi_w = _get_encoder_final_kernel(critic_params.get('psi_shared', {}))
+    if decomp.goal_encoder_mode == 'task_specific' and 'psi_task' in critic_params:
+        psi_w = _get_encoder_final_kernel(critic_params['psi_task'])
+    elif decomp.goal_encoder_mode in ('partial_shared', 'decomposed'):
+        # NRC2 on the shared goal trunk; task-specific psi tracked separately.
+        pass
+
+    _append_feature_metrics(
+        metrics, 'critic_sa_shared', z_shared, level, action_dim,
+        final_kernel=h_phi_w,
+    )
+    _append_feature_metrics(
+        metrics, 'critic_sa_task', z_task, level, action_dim,
+        final_kernel=phi_task_w,
+    )
+    _append_feature_metrics(
+        metrics, 'critic_sa_combined', z_sa, level, action_dim,
+        final_kernel=h_phi_w if decomp.combine_mode == 'add' else None,
+    )
+    _append_feature_metrics(
+        metrics, 'critic_g', z_g, level, nrc1_target_dim=1,
+        final_kernel=psi_w,
+    )
+
+    if level == 'occasional' and 'psi_task' in critic_params and \
+            decomp.goal_encoder_mode in ('partial_shared', 'decomposed',
+                                         'task_specific'):
+        z_g_task = decomp.psi_task.apply(
+            critic_params['psi_task'], goal_batch)
+        _append_feature_metrics(
+            metrics, 'critic_g_task', z_g_task, level, nrc1_target_dim=1,
+            final_kernel=_get_encoder_final_kernel(critic_params['psi_task']),
+        )
 
     return metrics

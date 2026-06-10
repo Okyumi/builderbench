@@ -2,6 +2,29 @@
 
 ## Status: Phase 6 — Batch Experiment Pipeline
 
+### Fix (Jun 10, 2026) — DCC dynamics loss `next_observation`
+
+- [x] **Symptom.** `continual_crl_dcc.py` smoke runs crashed with
+  `KeyError: 'next_observation'` on the first critic update when
+  `--dcc_use_dyn` is enabled (default).
+- [x] **Root cause.** `add_next_obs` injected `s′` into `extras` before
+  HER flatten, but `flatten_crl_fn` rebuilds `extras` and only keeps
+  `future_goal` + `state_extras`.
+- [x] **Fix.** Added `TrajectoryUniformSamplingQueue.flatten_crl_dcc_fn`
+  in `utils/buffer.py` (wraps `flatten_crl_fn`, sets
+  `extras['next_observation'] = transition.observation[1:]`). DCC
+  `learn_step` now vmaps this instead of the baseline flatten.
+  `continual_crl.py` unchanged.
+- [x] `doc/fix_dcc_dyn_loss_next_obs.md` — full write-up (paper alignment,
+  rationale, verification).
+- [x] `doc/2026-06-09_dcc_port.md` §5 — dynamics data path documented.
+- [x] Re-run GPU smoke test (§3.1 in port doc) and confirm finite
+  `dyn_mse` past step 1.
+- [x] **DCC rl_metrics.** Added `compute_all_metrics_dcc` with separate
+  `critic_sa_shared` / `critic_sa_task` / `critic_sa_combined` /
+  `critic_g` tracks; per-module weight norms; `apply_sa_shared_repr` /
+  `apply_sa_task_repr` on `DecomposedCriticNetworks`. Port doc §6.
+
 ### Fix A + B (Apr 26, 2026) — learnable α and JIT trace reuse
 
 - [x] Replaced the old `KnowledgePool` Python class with a JAX-friendly

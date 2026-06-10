@@ -96,7 +96,7 @@ class Args:
     wandb_entity: str = 'nyuad_mmvc'
     wandb_mode: str = 'online'
     wandb_dir: str = './'
-    wandb_group: str = 'dcc'
+    wandb_group: str = 'dccablation'
     wandb_name_tag: str = ''
 
     num_eval_steps: int = 50
@@ -545,11 +545,9 @@ def train_single_task(
 
     @jax.jit
     def update_critic(transitions, ts: DCCTrainingState, key):
-        # ``transitions`` is the per-sequence Transition with observation,
-        # action, and ``extras['future_goal']`` (set by the same
-        # ``flatten_crl_fn`` used by the baseline).  We additionally need
-        # ``next_observation`` for the dyn loss; the buffer's flatten
-        # produces it when called from learn_step (see code below).
+        # ``transitions`` is a flattened CRL batch: ``observation`` = s,
+        # ``extras['future_goal']`` = g, ``extras['next_observation']`` = s'
+        # (the latter from ``flatten_crl_dcc_fn`` in learn_step).
         state = transitions.observation
         action = transitions.action
         goal = transitions.extras['future_goal']
@@ -667,22 +665,10 @@ def train_single_task(
         ek, sk, tk = jax.random.split(key, 3)
         buffer_state, transitions = replay_buffer.sample(buffer_state)
 
-        # The standard CRL flatten produces ``future_goal``; we also need
-        # ``next_observation`` for the dyn loss. We get it by shifting the
-        # observation tensor along the sequence axis before flattening.
-        def add_next_obs(tr):
-            obs = tr.observation               # (B, T, obs)
-            next_obs = jnp.concatenate(
-                [obs[:, 1:], obs[:, -1:]], axis=1)
-            new_extras = dict(tr.extras)
-            new_extras['next_observation'] = next_obs
-            return tr._replace(extras=new_extras)
-
-        transitions = add_next_obs(transitions)
-
         batch_keys = jax.random.split(sk, transitions.observation.shape[0])
         transitions = jax.vmap(
-            TrajectoryUniformSamplingQueue.flatten_crl_fn, in_axes=(None, 0, 0)
+            TrajectoryUniformSamplingQueue.flatten_crl_dcc_fn,
+            in_axes=(None, 0, 0),
         )((args.discount,), transitions, batch_keys)
 
         transitions = jax.tree_util.tree_map(
@@ -740,24 +726,20 @@ def train_single_task(
                 next_metrics_frequent = ts + metrics_every
 
             try:
-                # Feature extraction uses the composed encoders, packaged
-                # so rl_metrics.compute_all_metrics can read them via the
-                # same (sa_encoder, g_encoder) interface as the baseline
-                # driver. We wrap the decomposed apply functions in
-                # picklable Module-like shims.
                 critic_p = _pack_critic(training_state)
                 _bs, sample_transitions = replay_buffer.sample(buffer_state)
                 obs_sample = sample_transitions.observation[0, :args.batch_size]
                 act_sample = sample_transitions.action[0, :args.batch_size]
                 goal_sample = sample_transitions.achieved_goal[0, :args.batch_size]
 
-                sa_apply = lambda p, s, a: decomp.apply_sa_repr(p, s, a)
-                g_apply = lambda p, g: decomp.apply_g_repr(p, g)
-                m = rl_metrics.compute_all_metrics(
-                    DCCSaAdapter(sa_apply), DCCGAdapter(g_apply),
-                    training_state.actor_state.params, critic_p,
+                m = rl_metrics.compute_all_metrics_dcc(
+                    decomp,
+                    training_state.actor_state.params,
+                    critic_p,
                     obs_sample, act_sample, goal_sample,
-                    action_dim=action_size, level=rl_level)
+                    action_dim=action_size,
+                    level=rl_level,
+                )
                 if args.track:
                     wandb_m = {f'rl_metrics/{k}': v for k, v in m.items()}
                     wandb_m['rl_metrics/env_steps'] = float(training_state.env_steps)
@@ -804,25 +786,6 @@ def train_single_task(
         psi_proj=(training_state.psi_proj_params, training_state.psi_proj_opt_state),
     )
     return training_state.actor_state, new_groups
-
-
-# Light adapter classes so rl_metrics' (sa_encoder, g_encoder)-typed
-# interface works for the decomposed critic too.  The .apply method is
-# the only thing rl_metrics ever calls.
-class DCCSaAdapter:
-    def __init__(self, sa_apply):
-        self._apply = sa_apply
-
-    def apply(self, params, s, a):
-        return self._apply(params, s, a)
-
-
-class DCCGAdapter:
-    def __init__(self, g_apply):
-        self._apply = g_apply
-
-    def apply(self, params, g):
-        return self._apply(params, g)
 
 
 # ---------------------------------------------------------------------------
