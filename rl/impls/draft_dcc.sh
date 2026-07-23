@@ -22,6 +22,17 @@
 #   sbatch draft_dcc.sh                # whole sweep
 #   sbatch --array=0-2 draft_dcc.sh    # first three ablations
 #   TASKS_PER_GPU=2 sbatch draft_dcc.sh
+#
+# GPU memory note (unrelated to checkpointing):
+#   TASKS_PER_GPU co-locates that many runs on one GPU and shrinks each run's
+#   XLA_PYTHON_CLIENT_MEM_FRACTION accordingly (1 -> 0.85, 2 -> 0.45, ...).
+#   The DCC replay prefill is memory-heavy, so for smoke/debug runs — or any
+#   ablation that OOMs during task-0 prefill (e.g. dcc_no_dyn was seen dying at
+#   RESOURCE_EXHAUSTED in prefill_replay_buffer) — launch with TASKS_PER_GPU=1
+#   to give the single run ~0.85 of the GPU:
+#       TASKS_PER_GPU=1 sbatch --array=0-0 draft_dcc.sh
+#   This is a *memory* concern only; it is independent of the task-boundary
+#   checkpoint-serialization fix (see doc/2026-07-23_dcc_task_boundary_fix.md).
 # =============================================================================
 
 set -euo pipefail

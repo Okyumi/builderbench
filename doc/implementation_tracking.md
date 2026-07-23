@@ -2,6 +2,41 @@
 
 ## Status: Phase 6 — Batch Experiment Pipeline
 
+### Fix (Jul 23, 2026) — DCC task-boundary checkpoint crash
+
+- [x] **Symptom.** Every DCC ablation trained task 0 to completion then
+  crashed at the first task boundary in `save_ckpt` →
+  `AttributeError: Can't pickle local object 'chain.<locals>.init_fn'`.
+  Shared across `dcc_add_shared`, `dcc_concat_shared`, `dcc_goal_task`,
+  `dcc_goal_partial`, `dcc_goal_decomposed`, `dcc_goal_projected`.
+- [x] **Root cause.** `save_ckpt` pickled the whole actor `TrainState`, whose
+  `tx` (Optax `chain` local closure) and `apply_fn` (bound method) are
+  unpicklable. Secondary bug: the destination file was opened before the
+  failing `pickle.dump`, leaving a zero-byte `task_00.pkl` that the old
+  `exists()`-only `auto_resume` treated as complete → silent task-skip.
+- [x] **Not this bug.** `dcc_no_dyn` (`7nr5eqad`) OOM'd earlier in task-0
+  replay prefill (`RESOURCE_EXHAUSTED`), never reaching `save_ckpt` — a
+  GPU-memory issue, handled separately via `TASKS_PER_GPU=1` guidance.
+- [x] **Fix.** New `utils/dcc_checkpoint.py`: versioned (`v2`), data-only
+  payload (actor `step`/`params`/`opt_state` + per-group `params`/`opt_state`,
+  arrays as host NumPy). Atomic write (temp + fsync + `os.replace`).
+  Validation rejects zero-byte / garbage / wrong-format / unsupported-version
+  / incomplete / task-idx-mismatch / config-mismatch / legacy payloads.
+  `restore_actor_state` rebuilds the `TrainState` with the current module +
+  optimiser; `restore_critic_groups` returns `(None, None)` for unbuilt
+  optional groups.
+- [x] **Resume.** `auto_resume` → `last_valid_contiguous_task`: stops at the
+  first missing/invalid checkpoint, so a partial/corrupt task is re-run not
+  skipped. Crashed sweep's zero-byte files are auto-rejected (no manual
+  cleanup). `continual_crl.py` unchanged.
+- [x] **Tests.** `tests/test_dcc_checkpoint.py` (tiny Flax/Optax pytrees) +
+  `tests/test_dcc_driver_checkpoint.py` (stubbed driver wiring). 22 passed on
+  CPU (`JAX_PLATFORMS=cpu pytest tests/`).
+- [x] `doc/2026-07-23_dcc_task_boundary_fix.md` — full write-up (root cause,
+  W&B evidence, schema, migration/resume, testing, HPC rerun commands).
+- [x] `draft_dcc.sh` header — `TASKS_PER_GPU=1` OOM mitigation note, kept
+  explicitly separate from the checkpoint fix.
+
 ### Fix (Jun 10, 2026) — DCC dynamics loss `next_observation`
 
 - [x] **Symptom.** `continual_crl_dcc.py` smoke runs crashed with

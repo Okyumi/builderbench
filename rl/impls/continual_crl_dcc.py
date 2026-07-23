@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import functools
 import os
-import pickle
 import pprint
 import sys
 import time
@@ -63,6 +62,7 @@ from utils.pad_wrapper import (
 )
 from utils.evaluation import Evaluator
 from utils.networks import save_params, load_params
+from utils import dcc_checkpoint
 
 # Prefer RL-local builderbench package over top-level namespace.
 RL_ROOT = Path(__file__).resolve().parents[1]
@@ -282,31 +282,70 @@ def _ckpt_path(base_dir, task_idx, args: Args):
     return _ckpt_dir(base_dir, args) / f'task_{task_idx:02d}.pkl'
 
 
-def save_ckpt(base_dir, task_idx, args: Args, data: Dict[str, Any]):
+def _ckpt_config(args: Args) -> Dict[str, Any]:
+    """Structural fingerprint embedded in each checkpoint for load-time
+    validation (see ``dcc_checkpoint.STRUCTURAL_CONFIG_KEYS``)."""
+    return {
+        'combine_mode': args.dcc_combine_mode,
+        'goal_encoder_mode': args.dcc_goal_encoder_mode,
+        'use_dyn': bool(args.dcc_use_dyn),
+        'rep_size': args.rep_size,
+        'phi_task_width': args.dcc_phi_task_width,
+        'phi_task_depth': args.dcc_phi_task_depth,
+        'seed': args.seed,
+    }
+
+
+def save_ckpt(base_dir, task_idx, task_id, args: Args, actor_state, critic_groups):
+    """Persist a versioned, data-only checkpoint atomically.
+
+    Only the actor ``step``/``params``/``opt_state`` and each critic group's
+    ``params``/``opt_state`` are stored — never the Optax ``tx`` or the module
+    ``apply_fn``, whose closures are unpicklable and caused the historical
+    ``chain.<locals>.init_fn`` crash. The write is atomic (temp file +
+    ``os.replace``) so a failure can never leave a partial checkpoint that
+    ``auto_resume`` would treat as complete.
+    """
     path = _ckpt_path(base_dir, task_idx, args)
-    os.makedirs(path.parent, exist_ok=True)
-    with open(path, 'wb') as f:
-        pickle.dump(data, f)
+    payload = dcc_checkpoint.build_payload(
+        task_idx=task_idx,
+        task_id=task_id,
+        actor_state=actor_state,
+        critic_groups=critic_groups,
+        config=_ckpt_config(args),
+    )
+    dcc_checkpoint.save_payload(path, payload)
     print(f'  Saved checkpoint to {path}', flush=True)
 
 
 def load_ckpt(base_dir, task_idx, args: Args):
+    """Load + validate a checkpoint payload (``None`` if the file is absent).
+
+    Raises ``dcc_checkpoint.CheckpointError`` on a corrupt, incomplete,
+    unsupported, or mismatched checkpoint.
+    """
     path = _ckpt_path(base_dir, task_idx, args)
-    if not path.exists():
-        return None
-    with open(path, 'rb') as f:
-        return pickle.load(f)
+    return dcc_checkpoint.load_payload(
+        path, expected_task_idx=task_idx, expected_config=_ckpt_config(args))
 
 
 def auto_resume(base_dir, num_tasks, args: Args) -> int:
-    """Return the index of the last fully-completed task (or -1)."""
-    last = -1
-    for probe in range(num_tasks):
-        if _ckpt_path(base_dir, probe, args).exists():
-            last = probe
-        else:
-            break
-    return last
+    """Return the index of the last VALID, CONTIGUOUS completed task (or -1).
+
+    A task counts as complete only when its checkpoint loads and validates.
+    A zero-byte, partial, corrupt, or config-mismatched checkpoint stops the
+    scan so the affected task is re-run rather than silently skipped.
+    """
+    def _log(idx, path):
+        print(f'  [auto-resume] Ignoring invalid/incomplete checkpoint for '
+              f'task {idx} ({path}); re-running from this task.', flush=True)
+
+    return dcc_checkpoint.last_valid_contiguous_task(
+        lambda i: _ckpt_path(base_dir, i, args),
+        num_tasks,
+        expected_config=_ckpt_config(args),
+        on_invalid=_log,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -882,13 +921,22 @@ def main(args: Args):
     groups = {n: (fresh[n], _opt_init(fresh[n])) for n in fresh}
 
     if start_task > 0:
+        # auto_resume already validated this checkpoint; reload it and
+        # reconstruct the actor TrainState with the CURRENT module/optimiser
+        # (the on-disk payload is data-only).
         ckpt = load_ckpt(args.checkpoint_dir, start_task - 1, args)
-        if ckpt is not None:
-            actor_state = ckpt['actor_state']
-            groups = ckpt['critic_groups']
-        else:
-            print('  Could not load checkpoint; starting from scratch.')
-            start_task = 0
+        if ckpt is None:
+            # auto_resume just reported this task complete, so a missing file
+            # here is a real inconsistency — fail loudly instead of silently
+            # restarting at the wrong task.
+            raise dcc_checkpoint.CheckpointError(
+                f'auto_resume reported task {start_task - 1} complete but its '
+                f'checkpoint is missing at '
+                f'{_ckpt_path(args.checkpoint_dir, start_task - 1, args)}.')
+        actor_state = dcc_checkpoint.restore_actor_state(ckpt, actor, actor_opt)
+        groups = dcc_checkpoint.restore_critic_groups(ckpt)
+        print(f'  Resumed from task {start_task - 1} '
+              f'(actor step={int(actor_state.step)}).', flush=True)
 
     # ---- task loop ---------------------------------------------------------
     for task_idx in range(start_task, num_tasks):
@@ -941,10 +989,8 @@ def main(args: Args):
         )
 
         if args.save_checkpoint:
-            save_ckpt(args.checkpoint_dir, task_idx, args, dict(
-                actor_state=actor_state,
-                critic_groups=groups,
-            ))
+            save_ckpt(args.checkpoint_dir, task_idx, task_id, args,
+                      actor_state, groups)
 
 
 if __name__ == '__main__':
